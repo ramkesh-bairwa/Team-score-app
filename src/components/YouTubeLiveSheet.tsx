@@ -1,7 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { View, Text, StyleSheet, Modal, TouchableOpacity, ScrollView, Share, Linking, ActivityIndicator } from 'react-native';
-import { LiveSession, LivePayload, getOverlayLink, isLocalAddress } from '../services/live';
+import { LiveSession, LivePayload, getCameraLinks, getOverlayLink, isLocalAddress } from '../services/live';
 import ServerSettings from './ServerSettings';
+import QRCode from './QRCode';
 import { popup } from './Popup';
 import { C } from '../theme/colors';
 
@@ -11,12 +12,31 @@ const STEPS = [
   { title: 'Point the camera & go live', body: 'Frame the ground, start the stream to YouTube. The scoreboard updates on its own every time you score a ball here.' },
 ];
 
-export default function YouTubeLiveSheet({ visible, session, getPayload, onClose }: {
+export default function YouTubeLiveSheet({ visible, session, getPayload, onClose, onConnectPhone, streamerName }: {
   visible: boolean; session: LiveSession; getPayload: () => LivePayload; onClose: () => void;
+  onConnectPhone: () => void; streamerName?: string | null;
 }) {
   const [url, setUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [serverModal, setServerModal] = useState(false);
+  // Built-in web camera: any phone/laptop scans the QR and streams from its browser
+  const [cam, setCam] = useState<{ studioUrl: string; watchUrl: string } | null>(null);
+  const [camLoading, setCamLoading] = useState(false);
+  const [camError, setCamError] = useState<string | null>(null);
+  const [qrFor, setQrFor] = useState<'studio' | 'watch'>('studio');
+
+  const loadCamera = () => {
+    setCamLoading(true);
+    setCamError(null);
+    getCameraLinks(session)
+      .then(l => { setCam(l); setQrFor('studio'); })
+      .catch((e: any) => setCamError(e.message))
+      .finally(() => setCamLoading(false));
+  };
+
+  const shareWatch = () => {
+    if (cam) Share.share({ message: `Watch the match live: ${cam.watchUrl}`, url: cam.watchUrl }).catch(() => {});
+  };
 
   const loadLink = () => {
     setUrl(null);
@@ -26,6 +46,7 @@ export default function YouTubeLiveSheet({ visible, session, getPayload, onClose
 
   useEffect(() => {
     if (visible) loadLink();
+    else { setCam(null); setCamError(null); }
   }, [visible, session.code]);
 
   const shareLink = () => {
@@ -50,6 +71,71 @@ export default function YouTubeLiveSheet({ visible, session, getPayload, onClose
                 <Text style={s.title}>Stream on YouTube Live</Text>
                 <Text style={s.sub}>Live scoreboard overlay for your stream</Text>
               </View>
+            </View>
+
+            {/* Any device as the camera, straight from its browser: score drawn on the video, replays,
+                full match video saved after the match */}
+            <View style={s.camBox}>
+              <Text style={s.phoneTitle}>🎥 Stream from any device (no app needed)</Text>
+              {cam ? (
+                <>
+                  <View style={s.tabs}>
+                    <TouchableOpacity style={[s.tab, qrFor === 'studio' && s.tabOn]} onPress={() => setQrFor('studio')}>
+                      <Text style={[s.tabText, qrFor === 'studio' && s.tabTextOn]}>Camera</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={[s.tab, qrFor === 'watch' && s.tabOn]} onPress={() => setQrFor('watch')}>
+                      <Text style={[s.tabText, qrFor === 'watch' && s.tabTextOn]}>Viewers</Text>
+                    </TouchableOpacity>
+                  </View>
+                  <View style={s.qrWrap}>
+                    <QRCode value={qrFor === 'studio' ? cam.studioUrl : cam.watchUrl} size={210} />
+                  </View>
+                  <Text style={s.phoneText}>
+                    {qrFor === 'studio'
+                      ? 'Scan with the camera device (phone, tablet or laptop). The camera studio opens in its browser with the live score on the video. Tap "Go live" there. You keep scoring here.'
+                      : 'Anyone can scan this or open the link to watch live. After the match the same link plays the full match video.'}
+                  </Text>
+                  <Text style={s.camLink} selectable numberOfLines={2}>{cam.watchUrl}</Text>
+                  <View style={s.errBtns}>
+                    <TouchableOpacity style={[s.btn, s.btnDarkGhost]} onPress={loadCamera}>
+                      <Text style={s.btnPrimaryText}>New QR</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={[s.btn, s.btnPrimary]} onPress={shareWatch}>
+                      <Text style={s.btnPrimaryText}>Share Watch Link</Text>
+                    </TouchableOpacity>
+                  </View>
+                  {isLocalAddress(cam.studioUrl) && (
+                    <Text style={s.camWarn}>
+                      ⚠️ Browsers only allow the camera over https. Start the server with go-live.sh and use its https address (⚙️ on Home).
+                    </Text>
+                  )}
+                </>
+              ) : (
+                <>
+                  <Text style={s.phoneText}>
+                    Show a QR code. Any device that scans it becomes the camera in its web browser, with the live score drawn on the video. You can share a watch link, replay the last minute, and the full match video is saved when the match ends.
+                  </Text>
+                  {camError && <Text style={s.camErr}>⛔ {camError}</Text>}
+                  <TouchableOpacity style={[s.btn, s.btnDark, camLoading && s.btnDisabled]} onPress={loadCamera} disabled={camLoading}>
+                    {camLoading ? <ActivityIndicator color={C.white} /> : <Text style={s.btnPrimaryText}>Show Camera QR</Text>}
+                  </TouchableOpacity>
+                </>
+              )}
+            </View>
+
+            {/* Two-device setup: this phone scores, a second phone films and streams */}
+            <View style={s.phoneBox}>
+              <Text style={s.phoneTitle}>📱 Use a second phone as the camera</Text>
+              {streamerName ? (
+                <Text style={s.phoneOk}>✅ Stream phone connected: {streamerName}</Text>
+              ) : (
+                <>
+                  <Text style={s.phoneText}>Keep scoring here. The second phone scans a QR, shows the live score in real time and streams to YouTube.</Text>
+                  <TouchableOpacity style={[s.btn, s.btnDark]} onPress={onConnectPhone}>
+                    <Text style={s.btnPrimaryText}>Connect Stream Phone</Text>
+                  </TouchableOpacity>
+                </>
+              )}
             </View>
 
             <View style={s.linkBox}>
@@ -130,6 +216,22 @@ const s = StyleSheet.create({
   ytLogoText: { color: C.white, fontSize: 16, fontWeight: '900', marginLeft: 2 },
   title: { fontSize: 19, fontWeight: '900', color: C.text },
   sub: { fontSize: 13, color: C.textSub, marginTop: 2 },
+  phoneBox: { backgroundColor: '#0B1730', borderRadius: 16, padding: 14, marginBottom: 12 },
+  camBox: { backgroundColor: '#13244A', borderRadius: 16, padding: 14, marginBottom: 12 },
+  tabs: { flexDirection: 'row', backgroundColor: '#0B1730', borderRadius: 10, padding: 3, marginBottom: 12 },
+  tab: { flex: 1, paddingVertical: 8, borderRadius: 8, alignItems: 'center' },
+  tabOn: { backgroundColor: C.white },
+  tabText: { color: '#CBD5E1', fontSize: 13, fontWeight: '800' },
+  tabTextOn: { color: '#0B1730' },
+  qrWrap: { alignSelf: 'center', backgroundColor: C.white, borderRadius: 14, padding: 6, marginBottom: 12 },
+  camLink: { color: '#FACC15', fontSize: 12, fontWeight: '700', marginBottom: 10 },
+  camErr: { color: '#FCA5A5', fontSize: 12, fontWeight: '700', lineHeight: 18, marginBottom: 10 },
+  camWarn: { color: '#FDBA74', fontSize: 11, lineHeight: 16, fontWeight: '600', marginTop: 10 },
+  btnDarkGhost: { backgroundColor: '#ffffff1f' },
+  phoneTitle: { color: C.white, fontSize: 14, fontWeight: '900', marginBottom: 6 },
+  phoneText: { color: '#CBD5E1', fontSize: 12, lineHeight: 18, marginBottom: 10 },
+  phoneOk: { color: '#4ADE80', fontSize: 13, fontWeight: '800' },
+  btnDark: { backgroundColor: C.primary, flex: 0 },
   linkBox: { backgroundColor: '#F8FAFC', borderRadius: 16, padding: 14, borderWidth: 1, borderColor: C.cardBorder, marginBottom: 12 },
   linkLabel: { fontSize: 10, fontWeight: '900', color: C.textMuted, letterSpacing: 1, marginBottom: 6 },
   link: { fontSize: 14, fontWeight: '700', color: C.accent },
