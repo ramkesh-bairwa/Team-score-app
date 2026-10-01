@@ -1,13 +1,14 @@
 import React, { useState } from 'react';
 import {
   View, Text, StyleSheet, ScrollView, TouchableOpacity,
-  TextInput, StatusBar, Alert, Modal, Image,
+  TextInput, StatusBar, Modal, Image,
 } from 'react-native';
 import { launchCamera, launchImageLibrary } from 'react-native-image-picker';
 import { C } from '../theme/colors';
+import { popup } from '../components/Popup';
 
 type PlayerRole = 'Batter' | 'Bowler' | 'All-Rounder' | 'Captain' | 'Keeper' | 'Impact Player';
-type Player = { name: string; nickname: string; photo?: string; roles: PlayerRole[] };
+type Player = { name: string; nickname: string; mobile?: string; photo?: string; roles: PlayerRole[] };
 
 const ALL_ROLES: { key: PlayerRole; icon: string }[] = [
   { key: 'Batter', icon: '🏏' },
@@ -36,46 +37,73 @@ export default function SetupTeamScreen({ navigation }: any) {
   const [playerModal, setPlayerModal] = useState(false);
   const [pendingName, setPendingName] = useState('');
   const [pendingNickname, setPendingNickname] = useState('');
+  const [pendingMobile, setPendingMobile] = useState('');
+  const [editingIdx, setEditingIdx] = useState<number | null>(null);
   const [pendingPhoto, setPendingPhoto] = useState<string | undefined>(undefined);
   const [selectedRoles, setSelectedRoles] = useState<PlayerRole[]>([]);
 
   const players = activeTeam === 1 ? team1Players : team2Players;
   const setPlayers = activeTeam === 1 ? setTeam1Players : setTeam2Players;
-  const playerNames = players.map(p => p.name);
+
+  const captain = activeTeam === 1 ? team1Captain : team2Captain;
+  const setCaptain = activeTeam === 1 ? setTeam1Captain : setTeam2Captain;
 
   const addPlayer = () => {
-    if (players.length >= 11) { Alert.alert('Limit', 'Max 11 players per team'); return; }
-    setPendingName('');
+    if (players.length >= 11) { popup.alert('Team Full', 'A team can have a maximum of 11 players.', undefined, 'warning'); return; }
+    setEditingIdx(null);
+    setPendingName(playerInput.trim());
     setPendingNickname('');
+    setPendingMobile('');
     setPendingPhoto(undefined);
     setSelectedRoles([]);
     setPlayerInput('');
     setPlayerModal(true);
   };
 
+  const editPlayer = (idx: number) => {
+    const p = players[idx];
+    setEditingIdx(idx);
+    setPendingName(p.name);
+    setPendingNickname(p.nickname);
+    setPendingMobile(p.mobile || '');
+    setPendingPhoto(p.photo);
+    setSelectedRoles(p.roles);
+    setPlayerModal(true);
+  };
+
   const confirmPlayer = () => {
     const name = pendingName.trim();
-    if (!name) { Alert.alert('Required', 'Enter player name'); return; }
-    if (playerNames.includes(name)) { Alert.alert('Duplicate', 'Player already added'); return; }
-    if (selectedRoles.length === 0) { Alert.alert('Required', 'Select at least one role'); return; }
-    const teamCaptainExists = players.some(p => p.roles.includes('Captain'));
-    if (selectedRoles.includes('Captain') && teamCaptainExists) {
-      Alert.alert('Captain Exists', 'A captain is already assigned to this team'); return;
+    const mobile = pendingMobile.replace(/[\s-]/g, '');
+    const others = players.filter((_, i) => i !== editingIdx);
+    if (!name) { popup.alert('Name Required', 'Please enter the player name.', undefined, 'warning'); return; }
+    if (others.some(p => p.name === name)) { popup.alert('Duplicate Player', `${name} is already in this team.`, undefined, 'warning'); return; }
+    if (mobile && !/^\+?\d{10,13}$/.test(mobile)) {
+      popup.alert('Invalid Mobile No.', 'Enter a valid 10-digit mobile number.', undefined, 'warning'); return;
     }
-    setPlayers([...players, { name, nickname: pendingNickname.trim(), photo: pendingPhoto, roles: selectedRoles }]);
-    if (selectedRoles.includes('Captain')) {
-      if (activeTeam === 1) setTeam1Captain(name);
-      else setTeam2Captain(name);
+    if (selectedRoles.length === 0) { popup.alert('Role Required', 'Select at least one role for the player.', undefined, 'warning'); return; }
+    if (selectedRoles.includes('Captain') && others.some(p => p.roles.includes('Captain'))) {
+      popup.alert('Captain Exists', 'A captain is already assigned to this team.', undefined, 'warning'); return;
     }
+    const player: Player = { name, nickname: pendingNickname.trim(), mobile: mobile || undefined, photo: pendingPhoto, roles: selectedRoles };
+    if (editingIdx === null) {
+      setPlayers([...players, player]);
+    } else {
+      setPlayers(players.map((p, i) => (i === editingIdx ? player : p)));
+    }
+    const oldName = editingIdx === null ? null : players[editingIdx].name;
+    if (selectedRoles.includes('Captain')) setCaptain(name);
+    else if (oldName && captain === oldName) setCaptain('');
     setPlayerModal(false);
   };
 
   const pickPhoto = () => {
-    Alert.alert('Player Photo', 'Choose option', [
-      { text: 'Camera', onPress: () => launchCamera({ mediaType: 'photo', quality: 0.7 }, r => { if (r.assets?.[0]?.uri) setPendingPhoto(r.assets[0].uri); }) },
-      { text: 'Gallery', onPress: () => launchImageLibrary({ mediaType: 'photo', quality: 0.7 }, r => { if (r.assets?.[0]?.uri) setPendingPhoto(r.assets[0].uri); }) },
-      { text: 'Cancel', style: 'cancel' },
-    ]);
+    const buttons: { text: string; style?: 'cancel' | 'destructive'; onPress?: () => void }[] = [
+      { text: '📷 Camera', onPress: () => launchCamera({ mediaType: 'photo', quality: 0.7 }, r => { if (r.assets?.[0]?.uri) setPendingPhoto(r.assets[0].uri); }) },
+      { text: '🖼️ Gallery', onPress: () => launchImageLibrary({ mediaType: 'photo', quality: 0.7 }, r => { if (r.assets?.[0]?.uri) setPendingPhoto(r.assets[0].uri); }) },
+    ];
+    if (pendingPhoto) buttons.push({ text: 'Remove Photo', style: 'destructive', onPress: () => setPendingPhoto(undefined) });
+    buttons.push({ text: 'Cancel', style: 'cancel' });
+    popup.show({ type: 'info', icon: '📸', title: 'Player Photo', message: 'Take a new photo or choose one from your gallery.', buttons });
   };
 
   const toggleRole = (role: PlayerRole) => {
@@ -83,26 +111,30 @@ export default function SetupTeamScreen({ navigation }: any) {
   };
 
   const removePlayer = (name: string) => {
-    setPlayers(players.filter(p => p.name !== name));
-    if (activeTeam === 1 && team1Captain === name) setTeam1Captain('');
-    if (activeTeam === 2 && team2Captain === name) setTeam2Captain('');
+    popup.alert('Remove Player?', `${name} will be removed from the team.`, [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Remove', style: 'destructive', onPress: () => {
+        setPlayers(players.filter(p => p.name !== name));
+        if (captain === name) setCaptain('');
+      }},
+    ]);
   };
 
   const goToPlayers = () => {
-    if (!team1Name.trim() || !team2Name.trim()) { Alert.alert('Required', 'Enter both team names'); return; }
-    if (team1Name.trim() === team2Name.trim()) { Alert.alert('Invalid', 'Team names must be different'); return; }
+    if (!team1Name.trim() || !team2Name.trim()) { popup.alert('Team Names Required', 'Enter names for both teams.', undefined, 'warning'); return; }
+    if (team1Name.trim() === team2Name.trim()) { popup.alert('Same Team Names', 'Both teams must have different names.', undefined, 'warning'); return; }
     setStep('players');
   };
 
   const goToSettings = () => {
-    if (team1Players.length < 2) { Alert.alert('Required', `Add at least 2 players to ${team1Name}`); return; }
-    if (team2Players.length < 2) { Alert.alert('Required', `Add at least 2 players to ${team2Name}`); return; }
+    if (team1Players.length < 2) { popup.alert('More Players Needed', `Add at least 2 players to ${team1Name}.`, undefined, 'warning'); setActiveTeam(1); return; }
+    if (team2Players.length < 2) { popup.alert('More Players Needed', `Add at least 2 players to ${team2Name}.`, undefined, 'warning'); setActiveTeam(2); return; }
     if (!team1Players.some(p => p.roles.includes('Captain'))) {
-      Alert.alert('Required', `${team1Name} mein ek Captain hona zaroori hai`);
+      popup.alert('Captain Required', `${team1Name} mein ek Captain hona zaroori hai`, undefined, 'warning');
       setActiveTeam(1); return;
     }
     if (!team2Players.some(p => p.roles.includes('Captain'))) {
-      Alert.alert('Required', `${team2Name} mein ek Captain hona zaroori hai`);
+      popup.alert('Captain Required', `${team2Name} mein ek Captain hona zaroori hai`, undefined, 'warning');
       setActiveTeam(2); return;
     }
     setStep('settings');
@@ -110,9 +142,9 @@ export default function SetupTeamScreen({ navigation }: any) {
 
   const startMatch = () => {
     const o = parseInt(overs, 10);
-    if (!o || o < 1 || o > 50) { Alert.alert('Invalid', 'Overs must be between 1 and 50'); return; }
-    if (!team1Captain) { Alert.alert('Required', `Pick captain for ${team1Name}`); return; }
-    if (!team2Captain) { Alert.alert('Required', `Pick captain for ${team2Name}`); return; }
+    if (!o || o < 1 || o > 50) { popup.alert('Invalid Overs', 'Overs must be between 1 and 50.', undefined, 'warning'); return; }
+    if (!team1Captain) { popup.alert('Captain Required', `Pick a captain for ${team1Name}.`, undefined, 'warning'); return; }
+    if (!team2Captain) { popup.alert('Captain Required', `Pick a captain for ${team2Name}.`, undefined, 'warning'); return; }
     navigation.navigate('Bet', {
       team1: { name: team1Name.trim(), players: team1Players.map(p => p.name), playerDetails: team1Players, captain: team1Captain },
       team2: { name: team2Name.trim(), players: team2Players.map(p => p.name), playerDetails: team2Players, captain: team2Captain },
@@ -231,12 +263,13 @@ export default function SetupTeamScreen({ navigation }: any) {
             {players.length > 0 && (
               <View style={s.card}>
                 {players.map((p, i) => (
-                  <View key={p.name} style={[s.playerRow, i < players.length - 1 && s.playerRowBorder]}>
+                  <TouchableOpacity key={p.name} activeOpacity={0.7} onPress={() => editPlayer(i)} style={[s.playerRow, i < players.length - 1 && s.playerRowBorder]}>
                     {p.photo
                       ? <Image source={{ uri: p.photo }} style={s.playerAvatar} />
                       : <View style={s.playerNumBadge}><Text style={s.playerNum}>{i + 1}</Text></View>}
                     <View style={{ flex: 1 }}>
                       <Text style={s.playerName}>{p.name}{p.nickname ? ` (${p.nickname})` : ''}</Text>
+                      {!!p.mobile && <Text style={s.playerMobile}>📱 {p.mobile}</Text>}
                       <View style={s.rolesWrap}>
                         {p.roles.map(r => {
                           const col = roleColor(r);
@@ -250,13 +283,18 @@ export default function SetupTeamScreen({ navigation }: any) {
                         })}
                       </View>
                     </View>
+                    <TouchableOpacity onPress={() => editPlayer(i)} style={s.editBtn}>
+                      <Text style={s.editBtnText}>✎</Text>
+                    </TouchableOpacity>
                     <TouchableOpacity onPress={() => removePlayer(p.name)} style={s.removeBtn}>
                       <Text style={s.removeBtnText}>✕</Text>
                     </TouchableOpacity>
-                  </View>
+                  </TouchableOpacity>
                 ))}
               </View>
             )}
+
+            {players.length > 0 && <Text style={s.hintText}>Tap a player to edit name, mobile or role</Text>}
 
             {players.length === 0 && (
               <View style={s.emptyBox}>
@@ -333,7 +371,7 @@ export default function SetupTeamScreen({ navigation }: any) {
       <Modal visible={playerModal} transparent animationType="slide">
         <View style={s.modalOverlay}>
           <ScrollView contentContainerStyle={s.modalBox} keyboardShouldPersistTaps="handled">
-            <Text style={s.modalTitle}>👤 Add Player</Text>
+            <Text style={s.modalTitle}>{editingIdx === null ? '👤 Add Player' : '✎ Edit Player'}</Text>
 
             {/* Photo */}
             <TouchableOpacity style={s.photoPickerBtn} onPress={pickPhoto}>
@@ -360,6 +398,15 @@ export default function SetupTeamScreen({ navigation }: any) {
               value={pendingNickname}
               onChangeText={setPendingNickname}
             />
+            <TextInput
+              style={s.modalInput}
+              placeholder="📱 Mobile No. (optional)"
+              placeholderTextColor={C.textMuted}
+              keyboardType="phone-pad"
+              maxLength={14}
+              value={pendingMobile}
+              onChangeText={setPendingMobile}
+            />
 
             {/* Roles */}
             <Text style={s.modalSub}>Select Role(s) *</Text>
@@ -381,7 +428,7 @@ export default function SetupTeamScreen({ navigation }: any) {
             </View>
 
             <TouchableOpacity style={s.confirmBtn} onPress={confirmPlayer}>
-              <Text style={s.confirmBtnText}>Add Player →</Text>
+              <Text style={s.confirmBtnText}>{editingIdx === null ? 'Add Player →' : 'Save Changes ✓'}</Text>
             </TouchableOpacity>
             <TouchableOpacity style={s.cancelBtn} onPress={() => setPlayerModal(false)}>
               <Text style={s.cancelBtnText}>Cancel</Text>
@@ -454,6 +501,10 @@ const s = StyleSheet.create({
   rolesWrap: { flexDirection: 'row', flexWrap: 'wrap', gap: 4 },
   roleBadge: { paddingHorizontal: 7, paddingVertical: 2, borderRadius: 6 },
   roleBadgeText: { fontSize: 10, fontWeight: '700' },
+  playerMobile: { fontSize: 12, color: C.textSub, marginBottom: 4 },
+  hintText: { fontSize: 12, color: C.textMuted, textAlign: 'center', marginTop: -4, marginBottom: 8 },
+  editBtn: { padding: 6, marginRight: 2 },
+  editBtnText: { color: C.accent, fontSize: 16, fontWeight: '700' },
   removeBtn: { padding: 6 },
   removeBtnText: { color: C.textMuted, fontSize: 14 },
   emptyBox: { alignItems: 'center', paddingVertical: 32 },

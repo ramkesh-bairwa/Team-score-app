@@ -1,9 +1,11 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   View, Text, StyleSheet, ScrollView, TouchableOpacity, StatusBar, Image,
 } from 'react-native';
 import { launchCamera } from 'react-native-image-picker';
-import { saveMatch as saveMatchApi, saveInProgressMatch } from '../services/api';
+import { useIsFocused } from '@react-navigation/native';
+import { saveMatch as saveMatchApi, saveInProgressMatch, getStorageMode } from '../services/api';
+import { pullLiveState } from '../services/live';
 import { C } from '../theme/colors';
 
 function BetSettlement({ resultText, battingTeam, fieldingTeam, bet, cap1PayPhoto, cap2PayPhoto, takePayPhoto }: any) {
@@ -117,7 +119,10 @@ export default function ScorecardScreen({ navigation, route }: any) {
     battingTeam, fieldingTeam, overs, innings1,
     isFirstInnings, liveView, innings2, matchType,
     fromHistory, bet, location, tossWinner, tossChoice,
+    live, liveMirror,
   } = route.params;
+  const isFocused = useIsFocused();
+  const liveVersion = useRef(0);
 
   const oversDisplay = `${innings1.overs}.${innings1.balls}`;
 
@@ -139,16 +144,45 @@ export default function ScorecardScreen({ navigation, route }: any) {
 
   useEffect(() => {
     if (!liveView && !isFirstInnings && !fromHistory) {
-      saveMatchApi({
-        battingTeam, fieldingTeam, overs, matchType, location,
-        tossWinner: tossWinner || '',
-        tossChoice: tossChoice || '',
-        betAmount: bet?.amount || 0,
-        bet: bet || null,
-        innings1, innings2, result: resultText,
-      }).catch(() => {});
+      saveResult();
     }
   }, []);
+
+  // At the innings break, co-scorers follow whoever starts the 2nd innings
+  useEffect(() => {
+    if (!live || !isFirstInnings || liveView || !isFocused) return;
+    let stopped = false;
+    const tick = async () => {
+      try {
+        const r = await pullLiveState(live, liveVersion.current);
+        if (stopped || !r.changed) return;
+        liveVersion.current = r.version;
+        const p = r.payload;
+        if (r.fromMe || !p || p.inningsNum !== 2) return;
+        if (p.phase === 'scoring') {
+          navigation.navigate('Scoring', { ...p.params, savedState: p.savedState, live });
+        } else {
+          navigation.navigate('Scorecard', { ...p.scorecardParams, live, liveMirror: true });
+        }
+      } catch (_) {}
+    };
+    tick();
+    const id = setInterval(tick, 2000);
+    return () => { stopped = true; clearInterval(id); };
+  }, [isFocused]);
+
+  const saveResult = async () => {
+    // With a central server, only the phone that finished the match uploads it
+    if (liveMirror && (await getStorageMode()) === 'central') return;
+    saveMatchApi({
+      battingTeam, fieldingTeam, overs, matchType, location,
+      tossWinner: tossWinner || '',
+      tossChoice: tossChoice || '',
+      betAmount: bet?.amount || 0,
+      bet: bet || null,
+      innings1, innings2, result: resultText,
+    }).catch(() => {});
+  };
 
   const takePayPhoto = (team: 1 | 2) => {
     launchCamera({ mediaType: 'photo', cameraType: 'front', quality: 0.7 }, res => {
@@ -331,9 +365,10 @@ export default function ScorecardScreen({ navigation, route }: any) {
                 target: innings1.runs + 1, innings1,
                 originalBattingTeam: battingTeam,
                 originalFieldingTeam: fieldingTeam, bet,
+                tossWinner, tossChoice,
               };
-              saveInProgressMatch({ ...secondInningsParams, isSecondInnings: true, savedState: null }).catch(() => {});
-              navigation.navigate('Scoring', secondInningsParams);
+              saveInProgressMatch({ ...secondInningsParams, isSecondInnings: true, savedState: null, live }).catch(() => {});
+              navigation.navigate('Scoring', { ...secondInningsParams, live });
             }}>
             <Text style={s.start2ndBtnText}>
               🏏 Start 2nd Innings — {fieldingTeam.name} needs {innings1.runs + 1}

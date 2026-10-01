@@ -12,11 +12,14 @@ CREATE TABLE IF NOT EXISTS players (
   team_id VARCHAR(36),
   name VARCHAR(100) NOT NULL,
   nickname VARCHAR(100),
+  mobile VARCHAR(20),
   photo TEXT,
   roles JSON,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE
 );
+
+-- Existing databases: ALTER TABLE players ADD COLUMN mobile VARCHAR(20) AFTER nickname;
 
 CREATE TABLE IF NOT EXISTS matches (
   id VARCHAR(36) PRIMARY KEY,

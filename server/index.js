@@ -1,13 +1,23 @@
 require('dotenv').config();
+const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const routes = require('./src/routes');
+const liveRoutes = require('./src/live');
 
 const app = express();
+// Behind a tunnel/proxy (cloudflared), use the forwarded https protocol for overlay links
+app.set('trust proxy', true);
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 const DB_RUN = process.env.DB_RUN === 'true';
+
+// Live match sharing is in-memory, so it works regardless of DB_RUN
+app.use('/api/live', liveRoutes);
+
+// YouTube score overlay page (add it as a browser source in the streaming app)
+app.get('/overlay/:code', (req, res) => res.sendFile(path.join(__dirname, 'src', 'overlay.html')));
 
 if (DB_RUN) {
   app.use('/api', routes);

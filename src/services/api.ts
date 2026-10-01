@@ -1,7 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import Config from 'react-native-config';
-
-const API_URL = Config.API_URL || 'http://10.0.2.2:3000/api';
+import { getApiUrl, fetchWithTimeout } from './server';
 const HISTORY_KEY = 'cricscore_match_history';
 const IN_PROGRESS_KEY = 'cricscore_inprogress_match';
 export const STORAGE_MODE_KEY = 'cricscore_storage_mode'; // 'local' | 'central'
@@ -18,7 +16,7 @@ export const setStorageMode = async (mode: 'local' | 'central') => {
 const isCentral = async () => (await getStorageMode()) === 'central';
 
 const api = async (method: string, path: string, body?: any) => {
-  const res = await fetch(`${API_URL}${path}`, {
+  const res = await fetchWithTimeout(`${await getApiUrl()}${path}`, {
     method,
     headers: { 'Content-Type': 'application/json' },
     body: body ? JSON.stringify(body) : undefined,
@@ -223,6 +221,11 @@ export const getMatches = async () => {
   }
 };
 
+export const getMatchFull = async (id: string) => {
+  if (!(await isCentral())) return null;
+  return api('GET', `/matches/${id}/full`);
+};
+
 export const clearMatches = async () => {
   await AsyncStorage.removeItem(HISTORY_KEY);
 };
@@ -237,7 +240,7 @@ export const savePlayers = async (teamId: string, players: any[]) => {
   for (const p of players) {
     await api('POST', '/players', {
       team_id: teamId,
-      name: p.name, nickname: p.nickname,
+      name: p.name, nickname: p.nickname, mobile: p.mobile,
       photo: p.photo, roles: p.roles,
     });
   }

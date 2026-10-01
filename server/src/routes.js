@@ -1,6 +1,6 @@
 const express = require('express');
 const { v4: uuid } = require('uuid');
-const { query } = require('../db');
+const { query } = require('./db');
 const router = express.Router();
 
 // ─── TEAMS ───────────────────────────────────────────────
@@ -35,11 +35,11 @@ router.get('/teams/:id', async (req, res) => {
 // POST /players
 router.post('/players', async (req, res) => {
   try {
-    const { team_id, name, nickname, photo, roles } = req.body;
+    const { team_id, name, nickname, mobile, photo, roles } = req.body;
     const id = uuid();
     await query(
-      'INSERT INTO players (id, team_id, name, nickname, photo, roles) VALUES (?, ?, ?, ?, ?, ?)',
-      [id, team_id, name, nickname || null, photo || null, JSON.stringify(roles || [])]
+      'INSERT INTO players (id, team_id, name, nickname, mobile, photo, roles) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [id, team_id, name, nickname || null, mobile || null, photo || null, JSON.stringify(roles || [])]
     );
     res.json({ success: true, id });
   } catch (e) { res.status(500).json({ error: e.message }); }

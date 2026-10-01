@@ -1,16 +1,22 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import {
   View, Text, StyleSheet, ScrollView, TouchableOpacity,
-  StatusBar, Alert, Modal, TextInput,
+  StatusBar, TextInput, ActivityIndicator,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useFocusEffect } from '@react-navigation/native';
 import { getInProgressMatch, clearInProgressMatch, getMatches, getMatchFull } from '../services/api';
 import Config from 'react-native-config';
 import { C } from '../theme/colors';
+import { popup, PopupCard, PopupIcon } from '../components/Popup';
+import { requestJoin, getJoinStatus, LivePayload } from '../services/live';
+import ServerSettings from '../components/ServerSettings';
 
 const DB_RUN = Config.DB_RUN === 'true';
 const HISTORY_KEY = 'cricscore_match_history';
+const SCORER_NAME_KEY = 'cricscore_scorer_name';
+// Wait for a closing popup card to finish animating before opening the next one
+const afterClose = (fn: () => void) => setTimeout(fn, 220);
 
 export default function HomeScreen({ navigation }: any) {
   const [activeTab, setActiveTab] = useState<'history'>('history');
@@ -18,6 +24,19 @@ export default function HomeScreen({ navigation }: any) {
   const [inProgress, setInProgress] = useState<any | null>(null);
   const [pwdModal, setPwdModal] = useState(false);
   const [pwdInput, setPwdInput] = useState('');
+  const [joinModal, setJoinModal] = useState(false);
+  const [serverModal, setServerModal] = useState(false);
+  const [joinCode, setJoinCode] = useState('');
+  const [joinName, setJoinName] = useState('');
+  const [joinState, setJoinState] = useState<'form' | 'sending' | 'waiting'>('form');
+  const [joinHost, setJoinHost] = useState('');
+  const joinPoll = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const stopJoinPoll = () => {
+    if (joinPoll.current) clearInterval(joinPoll.current);
+    joinPoll.current = null;
+  };
+  useEffect(() => stopJoinPoll, []);
 
   useFocusEffect(
     useCallback(() => {
@@ -59,11 +78,79 @@ export default function HomeScreen({ navigation }: any) {
       bet: inProgress.bet,
       location: inProgress.location,
       savedState: inProgress.savedState,
+      tossWinner: inProgress.tossWinner,
+      tossChoice: inProgress.tossChoice,
+      live: inProgress.live,
     });
   };
 
+  const openJoin = async () => {
+    setJoinCode('');
+    setJoinState('form');
+    setJoinName((await AsyncStorage.getItem(SCORER_NAME_KEY).catch(() => null)) || '');
+    setJoinModal(true);
+  };
+
+  const closeJoin = () => {
+    stopJoinPoll();
+    setJoinModal(false);
+  };
+
+  const enterLiveMatch = (code: string, token: string, payload: LivePayload | null | undefined) => {
+    const live = { code, token, role: 'scorer' };
+    if (!payload) {
+      popup.alert('Match Not Started', 'The scorer has not started scoring yet. Try joining again in a moment.', undefined, 'warning');
+      return;
+    }
+    if (payload.phase === 'innings_end') {
+      navigation.navigate('Scorecard', { ...payload.scorecardParams, live, liveMirror: true });
+    } else {
+      navigation.navigate('Scoring', { ...payload.params, savedState: payload.savedState, live });
+    }
+  };
+
+  const submitJoin = async () => {
+    const code = joinCode.trim().toUpperCase();
+    const name = joinName.trim();
+    if (code.length !== 6) { popup.alert('Invalid Code', 'Enter the 6-character match code shown on the scorer\'s phone.', undefined, 'warning'); return; }
+    if (!name) { popup.alert('Name Required', 'Enter your name so the scorer knows who is asking.', undefined, 'warning'); return; }
+    setJoinState('sending');
+    AsyncStorage.setItem(SCORER_NAME_KEY, name).catch(() => {});
+    try {
+      const { requestId, hostName } = await requestJoin(code, name);
+      setJoinHost(hostName);
+      setJoinState('waiting');
+      stopJoinPoll();
+      joinPoll.current = setInterval(async () => {
+        try {
+          const st = await getJoinStatus(code, requestId);
+          if (st.status === 'pending') return;
+          stopJoinPoll();
+          setJoinModal(false);
+          afterClose(() => {
+            if (st.status === 'approved') {
+              popup.show({
+                type: 'success', title: 'Access Granted', message: `${hostName} approved your request. You can now score this match.`,
+                buttons: [{ text: 'Start Scoring', onPress: () => enterLiveMatch(code, st.token!, st.payload) }],
+              });
+            } else {
+              popup.alert('Access Denied', `${hostName} did not allow you to score this match.`, undefined, 'error');
+            }
+          });
+        } catch (e: any) {
+          stopJoinPoll();
+          setJoinModal(false);
+          afterClose(() => popup.alert('Connection Lost', e.message, undefined, 'error'));
+        }
+      }, 2500);
+    } catch (e: any) {
+      setJoinState('form');
+      popup.alert('Could Not Join', e.message, undefined, 'error');
+    }
+  };
+
   const discardInProgress = () => {
-    Alert.alert('Discard Match?', 'This will delete the in-progress match.', [
+    popup.alert('Discard Match?', 'This will delete the in-progress match.', [
       { text: 'Cancel', style: 'cancel' },
       { text: 'Discard', style: 'destructive', onPress: async () => {
         await clearInProgressMatch();
@@ -79,11 +166,12 @@ export default function HomeScreen({ navigation }: any) {
 
   const confirmClearHistory = () => {
     if (pwdInput !== '061093') {
-      Alert.alert('Wrong Password', 'Incorrect password. Try again.');
+      setPwdModal(false);
+      afterClose(() => popup.alert('Wrong Password', 'Incorrect password. Try again.', [{ text: 'Try Again', onPress: () => { setPwdInput(''); setPwdModal(true); } }], 'error'));
       return;
     }
     setPwdModal(false);
-    Alert.alert('Clear History', 'Delete all match history?', [
+    afterClose(() => popup.alert('Clear History', 'Delete all match history? This cannot be undone.', [
       { text: 'Cancel', style: 'cancel' },
       {
         text: 'Clear', style: 'destructive', onPress: async () => {
@@ -91,7 +179,7 @@ export default function HomeScreen({ navigation }: any) {
           setHistory([]);
         },
       },
-    ]);
+    ]));
   };
 
   return (
@@ -103,11 +191,16 @@ export default function HomeScreen({ navigation }: any) {
           <Text style={s.headerGreet}>Welcome back 👋</Text>
           <Text style={s.headerTitle}>Cric<Text style={s.headerAccent}>Score</Text></Text>
         </View>
-        {history.length > 0 && (
-          <TouchableOpacity style={s.clearBtn} onPress={clearHistory}>
-            <Text style={s.clearBtnText}>Clear History</Text>
+        <View style={s.headerBtns}>
+          {history.length > 0 && (
+            <TouchableOpacity style={s.clearBtn} onPress={clearHistory}>
+              <Text style={s.clearBtnText}>Clear History</Text>
+            </TouchableOpacity>
+          )}
+          <TouchableOpacity style={s.gearBtn} onPress={() => setServerModal(true)}>
+            <Text style={s.gearText}>⚙️</Text>
           </TouchableOpacity>
-        )}
+        </View>
       </View>
 
       {/* Start Match Banner */}
@@ -119,6 +212,16 @@ export default function HomeScreen({ navigation }: any) {
         <View style={s.startBannerBtn}>
           <Text style={s.startBannerBtnText}>▶</Text>
         </View>
+      </TouchableOpacity>
+
+      {/* Join someone else's match */}
+      <TouchableOpacity style={s.joinBanner} onPress={openJoin}>
+        <Text style={s.joinIcon}>🔗</Text>
+        <View style={{ flex: 1 }}>
+          <Text style={s.joinTitle}>Join a Match with Code</Text>
+          <Text style={s.joinSub}>Score together with another scorer's phone</Text>
+        </View>
+        <Text style={s.joinArrow}>›</Text>
       </TouchableOpacity>
 
       <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={s.scroll}>
@@ -222,30 +325,82 @@ export default function HomeScreen({ navigation }: any) {
         )}
       </ScrollView>
 
-      {/* Password Modal */}
-      <Modal visible={pwdModal} transparent animationType="fade">
-        <View style={s.modalOverlay}>
-          <View style={s.modalBox}>
-            <Text style={s.modalTitle}>🔒 Enter Password</Text>
-            <Text style={s.modalSub}>Password required to clear history</Text>
+      {/* Password Popup */}
+      <PopupCard visible={pwdModal} onRequestClose={() => setPwdModal(false)}>
+        <PopupIcon type="warning" icon="🔒" />
+        <Text style={s.modalTitle}>Enter Password</Text>
+        <Text style={s.modalSub}>Password required to clear history</Text>
+        <TextInput
+          style={s.modalInput}
+          placeholder="Enter password"
+          placeholderTextColor={C.textMuted}
+          secureTextEntry
+          value={pwdInput}
+          onChangeText={setPwdInput}
+          autoFocus
+        />
+        <View style={s.modalBtnRow}>
+          <TouchableOpacity style={s.modalCancelBtn} onPress={() => setPwdModal(false)}>
+            <Text style={s.modalCancelText}>Cancel</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={s.modalConfirmBtn} onPress={confirmClearHistory}>
+            <Text style={s.modalConfirmText}>Confirm</Text>
+          </TouchableOpacity>
+        </View>
+      </PopupCard>
+
+      <ServerSettings visible={serverModal} onClose={() => setServerModal(false)} />
+
+      {/* Join Match Popup */}
+      <PopupCard visible={joinModal} onRequestClose={closeJoin}>
+        {joinState === 'waiting' ? (
+          <>
+            <PopupIcon type="info" icon="⏳" />
+            <Text style={s.modalTitle}>Waiting for Approval</Text>
+            <Text style={s.modalSub}>
+              Asked {joinHost || 'the scorer'} for access to match {joinCode.toUpperCase()}.{'\n'}Keep this screen open.
+            </Text>
+            <ActivityIndicator color={C.accent} size="large" style={{ marginVertical: 8 }} />
+            <TouchableOpacity style={[s.modalCancelBtn, s.modalCancelFull]} onPress={closeJoin}>
+              <Text style={s.modalCancelText}>Cancel Request</Text>
+            </TouchableOpacity>
+          </>
+        ) : (
+          <>
+            <PopupIcon type="info" icon="🔗" />
+            <Text style={s.modalTitle}>Join a Match</Text>
+            <Text style={s.modalSub}>Enter the code shown on the scorer's phone. They will need to allow you.</Text>
             <TextInput
-              style={s.modalInput}
-              placeholder="Enter password"
+              style={[s.modalInput, s.codeInput]}
+              placeholder="ABC123"
               placeholderTextColor={C.textMuted}
-              secureTextEntry
-              value={pwdInput}
-              onChangeText={setPwdInput}
+              autoCapitalize="characters"
+              autoCorrect={false}
+              maxLength={6}
+              value={joinCode}
+              onChangeText={v => setJoinCode(v.replace(/[^a-zA-Z0-9]/g, '').toUpperCase())}
               autoFocus
             />
-            <TouchableOpacity style={s.modalConfirmBtn} onPress={confirmClearHistory}>
-              <Text style={s.modalConfirmText}>Confirm</Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={s.modalCancelBtn} onPress={() => setPwdModal(false)}>
-              <Text style={s.modalCancelText}>Cancel</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      </Modal>
+            <TextInput
+              style={s.modalInput}
+              placeholder="Your name"
+              placeholderTextColor={C.textMuted}
+              value={joinName}
+              onChangeText={setJoinName}
+            />
+            <View style={s.modalBtnRow}>
+              <TouchableOpacity style={s.modalCancelBtn} onPress={closeJoin}>
+                <Text style={s.modalCancelText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[s.modalConfirmBtn, { backgroundColor: C.accent }]} onPress={submitJoin} disabled={joinState === 'sending'}>
+                {joinState === 'sending'
+                  ? <ActivityIndicator color={C.white} />
+                  : <Text style={s.modalConfirmText}>Request Access</Text>}
+              </TouchableOpacity>
+            </View>
+          </>
+        )}
+      </PopupCard>
     </View>
   );
 }
@@ -264,6 +419,12 @@ const s = StyleSheet.create({
     paddingHorizontal: 12, paddingVertical: 6, borderRadius: 8,
     backgroundColor: C.primaryLight, borderWidth: 1, borderColor: C.primary + '30',
   },
+  headerBtns: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  gearBtn: {
+    width: 34, height: 34, borderRadius: 17, backgroundColor: C.divider,
+    justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: C.cardBorder,
+  },
+  gearText: { fontSize: 16 },
   clearBtnText: { color: C.primary, fontSize: 12, fontWeight: '700' },
   startBanner: {
     marginHorizontal: 16, marginTop: 16, marginBottom: 4,
@@ -324,16 +485,29 @@ const s = StyleSheet.create({
   matchScore: { fontSize: 22, fontWeight: '900', color: C.primary },
   matchOvers: { fontSize: 12, color: C.textSub },
   viewDetail: { fontSize: 12, color: C.accent, fontWeight: '600' },
-  modalOverlay: { flex: 1, backgroundColor: '#00000060', justifyContent: 'center', alignItems: 'center', padding: 32 },
-  modalBox: { backgroundColor: C.white, borderRadius: 20, padding: 24, width: '100%' },
-  modalTitle: { fontSize: 18, fontWeight: '800', color: C.text, marginBottom: 4 },
-  modalSub: { fontSize: 13, color: C.textSub, marginBottom: 16 },
-  modalInput: {
-    backgroundColor: C.bg, borderRadius: 10, paddingHorizontal: 14, paddingVertical: 12,
-    fontSize: 15, color: C.text, borderWidth: 1, borderColor: C.cardBorder, marginBottom: 16,
+  joinBanner: {
+    marginHorizontal: 16, marginTop: 10, backgroundColor: C.white, borderRadius: 16,
+    paddingVertical: 12, paddingHorizontal: 14, flexDirection: 'row', alignItems: 'center', gap: 12,
+    borderWidth: 1, borderColor: C.accent + '30',
   },
-  modalConfirmBtn: { backgroundColor: C.primary, borderRadius: 12, paddingVertical: 13, alignItems: 'center', marginBottom: 10 },
+  joinIcon: { fontSize: 22 },
+  joinTitle: { fontSize: 14, fontWeight: '800', color: C.accent },
+  joinSub: { fontSize: 12, color: C.textSub, marginTop: 1 },
+  joinArrow: { fontSize: 26, color: C.accent, fontWeight: '300' },
+  modalTitle: { fontSize: 19, fontWeight: '800', color: C.text, marginBottom: 6, textAlign: 'center' },
+  modalSub: { fontSize: 14, color: C.textSub, marginBottom: 16, textAlign: 'center', lineHeight: 20 },
+  modalInput: {
+    alignSelf: 'stretch', backgroundColor: C.bg, borderRadius: 12, paddingHorizontal: 14, paddingVertical: 12,
+    fontSize: 15, color: C.text, borderWidth: 1, borderColor: C.cardBorder, marginBottom: 12,
+  },
+  codeInput: { fontSize: 24, fontWeight: '900', letterSpacing: 8, textAlign: 'center' },
+  modalBtnRow: { flexDirection: 'row', gap: 10, alignSelf: 'stretch', marginTop: 6 },
+  modalConfirmBtn: { flex: 1, backgroundColor: C.primary, borderRadius: 14, paddingVertical: 13, alignItems: 'center' },
   modalConfirmText: { color: C.white, fontWeight: '700', fontSize: 15 },
-  modalCancelBtn: { alignItems: 'center', paddingVertical: 8 },
-  modalCancelText: { color: C.textSub, fontSize: 14, fontWeight: '600' },
+  modalCancelBtn: {
+    flex: 1, backgroundColor: C.divider, borderRadius: 14, paddingVertical: 13, alignItems: 'center',
+    borderWidth: 1, borderColor: C.cardBorder,
+  },
+  modalCancelFull: { flex: 0, alignSelf: 'stretch', marginTop: 8 },
+  modalCancelText: { color: C.textSub, fontSize: 15, fontWeight: '700' },
 });

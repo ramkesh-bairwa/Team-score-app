@@ -1,0 +1,14 @@
+# Render.com blueprint: free hosting for the CricScore server (live sharing + YouTube overlay).
+# Match sharing and the overlay are in-memory, so no database is needed (DB_RUN=false).
+services:
+  - type: web
+    name: cricscore-server
+    runtime: node
+    plan: free
+    rootDir: server
+    buildCommand: npm install
+    startCommand: node index.js
+    healthCheckPath: /health
+    envVars:
+      - key: DB_RUN
+        value: "false"
