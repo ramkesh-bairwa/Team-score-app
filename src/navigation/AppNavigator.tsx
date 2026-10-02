@@ -10,6 +10,9 @@ import BetScreen from '../screens/BetScreen';
 import TossScreen from '../screens/TossScreen';
 import ScoringScreen from '../screens/ScoringScreen';
 import ScorecardScreen from '../screens/ScorecardScreen';
+import TeamsScreen from '../screens/TeamsScreen';
+import LiveStreamScreen from '../screens/LiveStreamScreen';
+import MatchVideoScreen from '../screens/MatchVideoScreen';
 
 const Stack = createNativeStackNavigator();
 
@@ -26,6 +29,9 @@ export default function AppNavigator() {
         <Stack.Screen name="Bet" component={BetScreen} options={{ gestureEnabled: false }} />
         <Stack.Screen name="Scoring" component={ScoringScreen} options={{ gestureEnabled: false }} />
         <Stack.Screen name="Scorecard" component={ScorecardScreen} />
+        <Stack.Screen name="Teams" component={TeamsScreen} />
+        <Stack.Screen name="LiveStream" component={LiveStreamScreen} options={{ gestureEnabled: false }} />
+        <Stack.Screen name="MatchVideo" component={MatchVideoScreen} />
       </Stack.Navigator>
     </NavigationContainer>
   );

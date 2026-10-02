@@ -6,6 +6,9 @@ import {
 import { launchCamera, launchImageLibrary } from 'react-native-image-picker';
 import { C } from '../theme/colors';
 import { popup } from '../components/Popup';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import TeamPicker from '../components/TeamPicker';
+import { SharedTeam, createTeam } from '../services/teams';
 
 type PlayerRole = 'Batter' | 'Bowler' | 'All-Rounder' | 'Captain' | 'Keeper' | 'Impact Player';
 type Player = { name: string; nickname: string; mobile?: string; photo?: string; roles: PlayerRole[] };
@@ -19,16 +22,25 @@ const ALL_ROLES: { key: PlayerRole; icon: string }[] = [
   { key: 'Impact Player', icon: '⚡' },
 ];
 
-export default function SetupTeamScreen({ navigation }: any) {
+const toPlayers = (team: SharedTeam): Player[] =>
+  team.players.map(p => ({ name: p.name, nickname: p.nickname || '', mobile: p.mobile, roles: p.roles as PlayerRole[] }));
+
+export default function SetupTeamScreen({ navigation, route }: any) {
+  // Opened from the Teams screen with a saved team pre-selected as "Your Team"
+  const preset: SharedTeam | undefined = route?.params?.presetTeam;
   const [step, setStep] = useState<'teams' | 'players' | 'settings'>('teams');
-  const [team1Name, setTeam1Name] = useState('');
+  const [team1Name, setTeam1Name] = useState(preset?.name ?? '');
   const [team2Name, setTeam2Name] = useState('');
   const [activeTeam, setActiveTeam] = useState<1 | 2>(1);
-  const [team1Players, setTeam1Players] = useState<Player[]>([]);
+  const [team1Players, setTeam1Players] = useState<Player[]>(preset ? toPlayers(preset) : []);
   const [team2Players, setTeam2Players] = useState<Player[]>([]);
   const [playerInput, setPlayerInput] = useState('');
-  const [team1Captain, setTeam1Captain] = useState('');
+  const [team1Captain, setTeam1Captain] = useState(preset?.captain ?? '');
   const [team2Captain, setTeam2Captain] = useState('');
+  const [savedId1, setSavedId1] = useState<string | undefined>(preset?.id);
+  const [savedId2, setSavedId2] = useState<string | undefined>(undefined);
+  const [pickerFor, setPickerFor] = useState<1 | 2 | null>(null);
+  const [savingTeam, setSavingTeam] = useState(false);
   const [overs, setOvers] = useState('10');
   const [matchType, setMatchType] = useState<'local' | 'domestic'>('local');
   const [location, setLocation] = useState('');
@@ -41,6 +53,36 @@ export default function SetupTeamScreen({ navigation }: any) {
   const [editingIdx, setEditingIdx] = useState<number | null>(null);
   const [pendingPhoto, setPendingPhoto] = useState<string | undefined>(undefined);
   const [selectedRoles, setSelectedRoles] = useState<PlayerRole[]>([]);
+
+  const pickSaved = (n: 1 | 2, team: SharedTeam) => {
+    const list = toPlayers(team);
+    const captain = list.find(p => p.roles.includes('Captain'))?.name || team.captain;
+    if (n === 1) { setTeam1Name(team.name); setTeam1Players(list); setTeam1Captain(captain); setSavedId1(team.id); }
+    else { setTeam2Name(team.name); setTeam2Players(list); setTeam2Captain(captain); setSavedId2(team.id); }
+    setPickerFor(null);
+  };
+
+  // Publish the team being built so other app users can pick it next time
+  const saveForEveryone = async () => {
+    const name = (activeTeam === 1 ? team1Name : team2Name).trim();
+    const list = activeTeam === 1 ? team1Players : team2Players;
+    if (list.length < 2) { popup.alert('More Players Needed', 'Add at least 2 players before saving the team.', undefined, 'warning'); return; }
+    setSavingTeam(true);
+    try {
+      const by = (await AsyncStorage.getItem('cricscore_scorer_name').catch(() => null)) || 'Unknown';
+      const saved = await createTeam(name, list.map(p => ({ name: p.name, nickname: p.nickname || undefined, mobile: p.mobile, roles: p.roles })), by);
+      if (activeTeam === 1) setSavedId1(saved.id); else setSavedId2(saved.id);
+      if (saved.pending) {
+        popup.alert('Saved on This Phone', `No internet right now. ${name} will be shared with everyone when you sync from Teams.`, undefined, 'warning');
+      } else {
+        popup.alert('Team Saved', `${name} is now available to everyone in Teams.`, undefined, 'success');
+      }
+    } catch (e: any) {
+      popup.alert('Could Not Save Team', e.message, undefined, 'error');
+    } finally {
+      setSavingTeam(false);
+    }
+  };
 
   const players = activeTeam === 1 ? team1Players : team2Players;
   const setPlayers = activeTeam === 1 ? setTeam1Players : setTeam2Players;
@@ -216,11 +258,32 @@ export default function SetupTeamScreen({ navigation }: any) {
             </View>
             <Text style={s.sectionTitle}>Team Names</Text>
             <View style={s.card}>
-              <Text style={s.inputLabel}>🏏 Your Team</Text>
-              <TextInput style={s.input} placeholder="e.g. Mumbai Indians" placeholderTextColor={C.textMuted} value={team1Name} onChangeText={setTeam1Name} />
-              <View style={s.divider} />
-              <Text style={s.inputLabel}>⚔️ Opponent Team</Text>
-              <TextInput style={s.input} placeholder="e.g. Chennai Super Kings" placeholderTextColor={C.textMuted} value={team2Name} onChangeText={setTeam2Name} />
+              {([1, 2] as const).map(n => {
+                const name = n === 1 ? team1Name : team2Name;
+                const count = (n === 1 ? team1Players : team2Players).length;
+                const savedId = n === 1 ? savedId1 : savedId2;
+                return (
+                  <View key={n}>
+                    {n === 2 && <View style={s.divider} />}
+                    <View style={s.teamLabelRow}>
+                      <Text style={s.inputLabel}>{n === 1 ? '🏏 Your Team' : '⚔️ Opponent Team'}</Text>
+                      <TouchableOpacity style={s.pickBtn} onPress={() => setPickerFor(n)}>
+                        <Text style={s.pickBtnText}>👥 Pick saved team</Text>
+                      </TouchableOpacity>
+                    </View>
+                    <TextInput
+                      style={s.input}
+                      placeholder={n === 1 ? 'e.g. Mumbai Indians' : 'e.g. Chennai Super Kings'}
+                      placeholderTextColor={C.textMuted}
+                      value={name}
+                      onChangeText={v => {
+                        if (n === 1) { setTeam1Name(v); setSavedId1(undefined); } else { setTeam2Name(v); setSavedId2(undefined); }
+                      }}
+                    />
+                    {!!savedId && <Text style={s.loadedText}>✓ Saved team loaded · {count} players</Text>}
+                  </View>
+                );
+              })}
               <View style={s.divider} />
               <Text style={s.inputLabel}>📍 Match Location</Text>
               <TextInput style={s.input} placeholder="e.g. Wankhede Stadium, Mumbai" placeholderTextColor={C.textMuted} value={location} onChangeText={setLocation} />
@@ -303,6 +366,14 @@ export default function SetupTeamScreen({ navigation }: any) {
               </View>
             )}
 
+            {players.length >= 2 && !(activeTeam === 1 ? savedId1 : savedId2) && (
+              <TouchableOpacity style={s.saveTeamBtn} onPress={saveForEveryone} disabled={savingTeam}>
+                <Text style={s.saveTeamText}>
+                  {savingTeam ? 'Saving…' : `☁️ Save ${(activeTeam === 1 ? team1Name : team2Name) || 'team'} for everyone`}
+                </Text>
+              </TouchableOpacity>
+            )}
+
             <TouchableOpacity style={s.primaryBtn} onPress={goToSettings}>
               <Text style={s.primaryBtnText}>Next: Match Settings →</Text>
             </TouchableOpacity>
@@ -366,6 +437,14 @@ export default function SetupTeamScreen({ navigation }: any) {
           </View>
         )}
       </ScrollView>
+
+      <TeamPicker
+        visible={pickerFor !== null}
+        title={pickerFor === 2 ? 'Pick Opponent Team' : 'Pick Your Team'}
+        excludeId={pickerFor === 1 ? savedId2 : savedId1}
+        onPick={team => pickerFor && pickSaved(pickerFor, team)}
+        onClose={() => setPickerFor(null)}
+      />
 
       {/* Player Add Modal */}
       <Modal visible={playerModal} transparent animationType="slide">
@@ -506,6 +585,15 @@ const s = StyleSheet.create({
   editBtn: { padding: 6, marginRight: 2 },
   editBtnText: { color: C.accent, fontSize: 16, fontWeight: '700' },
   removeBtn: { padding: 6 },
+  teamLabelRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  pickBtn: { backgroundColor: C.greenLight, borderRadius: 10, paddingHorizontal: 10, paddingVertical: 5, marginBottom: 8 },
+  pickBtnText: { color: C.green, fontSize: 12, fontWeight: '800' },
+  loadedText: { fontSize: 12, color: C.green, fontWeight: '700', marginTop: 2 },
+  saveTeamBtn: {
+    borderRadius: 14, paddingVertical: 13, alignItems: 'center', marginTop: 4,
+    borderWidth: 1.5, borderColor: C.green, borderStyle: 'dashed', backgroundColor: C.greenLight,
+  },
+  saveTeamText: { color: C.green, fontSize: 14, fontWeight: '800' },
   removeBtnText: { color: C.textMuted, fontSize: 14 },
   emptyBox: { alignItems: 'center', paddingVertical: 32 },
   emptyIcon: { fontSize: 36, marginBottom: 8 },

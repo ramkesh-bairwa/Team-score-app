@@ -1,16 +1,64 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Config from 'react-native-config';
+import { PUBLIC_SERVER_URLS } from '../config/publicServer';
 
 const SERVER_KEY = 'cricscore_server_url';
 // 10.0.2.2 is the host machine as seen from the Android emulator only
 export const DEFAULT_API_URL = Config.API_URL || 'http://10.0.2.2:3000/api';
 
 let cached: string | null = null;
+let reachable = false;
+let resolving: Promise<string> | null = null;
 
-// The server address can be changed in-app (no rebuild), e.g. to the laptop's Wi-Fi IP or a hosted server
-export const getApiUrl = async () => {
-  if (!cached) cached = (await AsyncStorage.getItem(SERVER_KEY).catch(() => null)) || DEFAULT_API_URL;
-  return cached;
+const quickHealth = async (apiUrl: string, ms: number) => {
+  try {
+    const res = await fetchWithTimeout(`${apiUrl.replace(/\/api$/, '')}/health`, {}, ms);
+    return res.ok;
+  } catch {
+    return false;
+  }
+};
+
+// Picks the first reachable server, in priority order: address saved in the app, the public
+// server, the address built into the app, then the emulator address. All are probed in parallel.
+export const refreshApiUrl = (): Promise<string> => {
+  if (resolving) return resolving;
+  resolving = (async () => {
+    const saved = await AsyncStorage.getItem(SERVER_KEY).catch(() => null);
+    const candidates = [...new Set([saved, ...PUBLIC_SERVER_URLS, Config.API_URL, 'http://10.0.2.2:3000/api']
+      .filter((u): u is string => !!u))];
+    // Settle as soon as the best-priority reachable address is known (don't wait for slow failures)
+    const idx = await new Promise<number>(resolve => {
+      const results: (boolean | undefined)[] = candidates.map(() => undefined);
+      let grace: ReturnType<typeof setTimeout> | null = null;
+      const best = () => results.findIndex(r => r === true);
+      const decide = () => {
+        for (let i = 0; i < results.length; i++) {
+          if (results[i] === undefined) {
+            // A better address is still being checked; once something works, wait at most 2.5s for it
+            if (best() >= 0 && !grace) grace = setTimeout(() => resolve(best()), 2500);
+            return;
+          }
+          if (results[i]) { if (grace) clearTimeout(grace); resolve(i); return; }
+        }
+        resolve(-1);
+      };
+      candidates.forEach((u, i) => quickHealth(u, 8000).then(ok => { results[i] = ok; decide(); }));
+    });
+    reachable = idx >= 0;
+    cached = idx >= 0 ? candidates[idx] : candidates[0];
+    return cached;
+  })().finally(() => { resolving = null; });
+  return resolving;
+};
+
+// The server address can be changed in-app (no rebuild); otherwise it is found automatically
+export const getApiUrl = async () => cached || refreshApiUrl();
+
+// True when some server address answered (probes again if needed)
+export const isServerConfigured = async () => {
+  if (!reachable) await refreshApiUrl();
+  return reachable;
 };
 
 // Accepts "192.168.1.49", "192.168.1.49:3000", "http://host:3000" or a full ".../api" URL
@@ -27,8 +75,8 @@ export const setApiUrl = async (input: string) => {
   const url = normalizeApiUrl(input);
   if (url) await AsyncStorage.setItem(SERVER_KEY, url);
   else await AsyncStorage.removeItem(SERVER_KEY);
-  cached = url || DEFAULT_API_URL;
-  return cached;
+  cached = url || null;
+  return refreshApiUrl();
 };
 
 // Free hosts (e.g. Render) sleep when idle and can take up to a minute to wake up

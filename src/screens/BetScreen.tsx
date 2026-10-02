@@ -7,17 +7,37 @@ import { launchCamera } from 'react-native-image-picker';
 import { C } from '../theme/colors';
 
 const PRESETS = ['10', '20', '50', '100'];
+const EXPENSE_PRESETS = ['Ground fee', 'Ball fee', 'Umpire fee', 'Refreshments', 'Equipment'];
+export const BALL_TYPES = [
+  { key: 'Tennis', icon: '🎾' },
+  { key: 'Leather', icon: '🔴' },
+  { key: 'Plastic', icon: '⚪' },
+  { key: 'Wind', icon: '🌬️' },
+];
+type Expense = { label: string; amount: string };
 
 export default function BetScreen({ navigation, route }: any) {
   const { team1, team2, overs, matchType, location } = route.params;
 
-  const [betType, setBetType] = useState<'free' | 'paid' | null>(null);
+  const [betType, setBetType] = useState<'free' | 'paid' | 'loser' | null>(null);
+  // Loser to pay: the losing team covers the match expenses
+  const [expenses, setExpenses] = useState<Expense[]>([{ label: 'Ground fee', amount: '' }]);
+  const [expenseNote, setExpenseNote] = useState('');
+  const [ballType, setBallType] = useState('Tennis');
   const [amount, setAmount] = useState('');
   const [customAmount, setCustomAmount] = useState('');
   const [cap1Photo, setCap1Photo] = useState<string | null>(null);
   const [cap2Photo, setCap2Photo] = useState<string | null>(null);
 
   const finalAmount = amount === 'custom' ? customAmount : amount;
+  const expenseTotal = expenses.reduce((sum, e) => sum + (parseInt(e.amount, 10) || 0), 0);
+
+  const addExpense = (label: string) => {
+    if (expenses.some(e => e.label === label) && label !== 'Other') return;
+    setExpenses([...expenses, { label, amount: '' }]);
+  };
+  const updateExpense = (i: number, patch: Partial<Expense>) =>
+    setExpenses(expenses.map((e, idx) => (idx === i ? { ...e, ...patch } : e)));
 
   const capturePhoto = (captain: 1 | 2) => {
     launchCamera({ mediaType: 'photo', cameraType: 'front', quality: 0.7 }, res => {
@@ -34,13 +54,22 @@ export default function BetScreen({ navigation, route }: any) {
       if (!finalAmount || parseInt(finalAmount) < 1) return false;
       if (!cap1Photo || !cap2Photo) return false;
     }
+    if (betType === 'loser' && expenseTotal < 1) return false;
     return true;
   };
 
   const proceed = () => {
+    // ballType travels inside `bet`, which is already passed through every match screen
     const bet = betType === 'paid'
-      ? { type: 'paid', amount: parseInt(finalAmount), cap1Photo, cap2Photo }
-      : { type: 'free', amount: 0 };
+      ? { type: 'paid', amount: parseInt(finalAmount), cap1Photo, cap2Photo, ballType }
+      : betType === 'loser'
+        ? {
+          type: 'loser', amount: expenseTotal, ballType, note: expenseNote.trim(),
+          expenses: expenses
+            .filter(e => (parseInt(e.amount, 10) || 0) > 0)
+            .map(e => ({ label: e.label.trim() || 'Other', amount: parseInt(e.amount, 10) })),
+        }
+        : { type: 'free', amount: 0, ballType };
     navigation.navigate('Toss', {
       team1, team2, overs, matchType, location, bet,
     });
@@ -79,7 +108,64 @@ export default function BetScreen({ navigation, route }: any) {
             <Text style={s.typeDesc}>Set bet amount</Text>
             {betType === 'paid' && <View style={s.check}><Text style={s.checkText}>✓</Text></View>}
           </TouchableOpacity>
+          <TouchableOpacity
+            style={[s.typeBtn, betType === 'loser' && s.typeBtnActive]}
+            onPress={() => setBetType('loser')}>
+            <Text style={s.typeIcon}>🧾</Text>
+            <Text style={[s.typeText, betType === 'loser' && s.typeTextActive]}>Loser to Pay</Text>
+            <Text style={s.typeDesc}>Loser pays expenses</Text>
+            {betType === 'loser' && <View style={s.check}><Text style={s.checkText}>✓</Text></View>}
+          </TouchableOpacity>
         </View>
+
+        {betType === 'loser' && (
+          <>
+            <Text style={s.sectionTitle}>Match Expenses (₹)</Text>
+            <View style={s.card}>
+              {expenses.map((e, i) => (
+                <View key={i} style={s.expenseRow}>
+                  <TextInput
+                    style={[s.expenseInput, s.expenseLabel]}
+                    value={e.label}
+                    onChangeText={v => updateExpense(i, { label: v })}
+                    placeholder="Expense"
+                    placeholderTextColor={C.textMuted}
+                  />
+                  <TextInput
+                    style={[s.expenseInput, s.expenseAmount]}
+                    value={e.amount}
+                    onChangeText={v => updateExpense(i, { amount: v.replace(/[^0-9]/g, '') })}
+                    placeholder="₹ 0"
+                    placeholderTextColor={C.textMuted}
+                    keyboardType="number-pad"
+                  />
+                  <TouchableOpacity style={s.expenseRemove} onPress={() => setExpenses(expenses.filter((_, idx) => idx !== i))}>
+                    <Text style={s.expenseRemoveText}>✕</Text>
+                  </TouchableOpacity>
+                </View>
+              ))}
+              <View style={s.expenseChips}>
+                {[...EXPENSE_PRESETS, 'Other'].filter(l => l === 'Other' || !expenses.some(e => e.label === l)).map(l => (
+                  <TouchableOpacity key={l} style={s.expenseChip} onPress={() => addExpense(l)}>
+                    <Text style={s.expenseChipText}>+ {l}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+              <TextInput
+                style={s.noteInput}
+                value={expenseNote}
+                onChangeText={setExpenseNote}
+                placeholder="📝 Note (e.g. ground booked for 2 hours, 2 new balls)"
+                placeholderTextColor={C.textMuted}
+                multiline
+              />
+              <View style={s.expenseTotal}>
+                <Text style={s.expenseTotalLabel}>Losing team pays</Text>
+                <Text style={s.expenseTotalVal}>₹{expenseTotal}</Text>
+              </View>
+            </View>
+          </>
+        )}
 
         {betType === 'paid' && (
           <>
@@ -152,12 +238,22 @@ export default function BetScreen({ navigation, route }: any) {
           </>
         )}
 
+        <Text style={s.sectionTitle}>Ball Type</Text>
+        <View style={s.ballRow}>
+          {BALL_TYPES.map(b => (
+            <TouchableOpacity key={b.key} style={[s.ballBtn, ballType === b.key && s.ballBtnOn]} onPress={() => setBallType(b.key)}>
+              <Text style={s.ballIcon}>{b.icon}</Text>
+              <Text style={[s.ballText, ballType === b.key && s.ballTextOn]}>{b.key}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+
         <TouchableOpacity
           style={[s.proceedBtn, !canProceed() && s.proceedBtnDisabled]}
           onPress={proceed}
           disabled={!canProceed()}>
           <Text style={s.proceedBtnText}>
-            {betType === 'paid' ? '💰 Confirm & Proceed to Toss' : '🏏 Proceed to Toss'}
+            {betType === 'paid' ? '💰 Confirm & Proceed to Toss' : betType === 'loser' ? `🧾 Loser pays ₹${expenseTotal} · Proceed to Toss` : '🏏 Proceed to Toss'}
           </Text>
         </TouchableOpacity>
       </ScrollView>
@@ -177,9 +273,9 @@ const s = StyleSheet.create({
   scroll: { padding: 16, paddingBottom: 40 },
   matchLabel: { fontSize: 18, fontWeight: '800', color: C.text, textAlign: 'center', marginBottom: 20 },
   sectionTitle: { fontSize: 13, fontWeight: '700', color: C.textSub, marginBottom: 10, marginTop: 4 },
-  row: { flexDirection: 'row', gap: 12, marginBottom: 20 },
+  row: { flexDirection: 'row', gap: 8, marginBottom: 20 },
   typeBtn: {
-    flex: 1, backgroundColor: C.white, borderRadius: 16, padding: 16,
+    flex: 1, backgroundColor: C.white, borderRadius: 16, paddingVertical: 14, paddingHorizontal: 6,
     alignItems: 'center', borderWidth: 2, borderColor: C.cardBorder, position: 'relative',
   },
   typeBtnActive: { borderColor: C.primary, backgroundColor: C.primaryLight },
@@ -236,6 +332,37 @@ const s = StyleSheet.create({
     paddingHorizontal: 10, paddingVertical: 4,
   },
   photoDoneText: { color: C.green, fontSize: 11, fontWeight: '700' },
+  expenseRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 8 },
+  expenseInput: {
+    backgroundColor: C.bg, borderRadius: 10, paddingHorizontal: 12, paddingVertical: 10,
+    fontSize: 14, color: C.text, borderWidth: 1, borderColor: C.cardBorder,
+  },
+  expenseLabel: { flex: 1 },
+  expenseAmount: { width: 90, textAlign: 'right', fontWeight: '800' },
+  expenseRemove: { padding: 6 },
+  expenseRemoveText: { color: C.textMuted, fontSize: 14 },
+  expenseChips: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginVertical: 6 },
+  expenseChip: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 14, backgroundColor: C.accentLight },
+  expenseChipText: { color: C.accent, fontSize: 12, fontWeight: '700' },
+  noteInput: {
+    backgroundColor: C.bg, borderRadius: 10, paddingHorizontal: 12, paddingVertical: 10, minHeight: 56,
+    fontSize: 13, color: C.text, borderWidth: 1, borderColor: C.cardBorder, marginTop: 6, textAlignVertical: 'top',
+  },
+  expenseTotal: {
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 12,
+    backgroundColor: C.orangeLight, borderRadius: 10, paddingHorizontal: 14, paddingVertical: 10,
+  },
+  expenseTotalLabel: { fontSize: 13, fontWeight: '800', color: '#9A3412' },
+  expenseTotalVal: { fontSize: 18, fontWeight: '900', color: C.orange },
+  ballRow: { flexDirection: 'row', gap: 8, marginBottom: 20 },
+  ballBtn: {
+    flex: 1, backgroundColor: C.white, borderRadius: 14, paddingVertical: 12, alignItems: 'center',
+    borderWidth: 2, borderColor: C.cardBorder,
+  },
+  ballBtnOn: { borderColor: C.green, backgroundColor: C.greenLight },
+  ballIcon: { fontSize: 22, marginBottom: 4 },
+  ballText: { fontSize: 12, fontWeight: '800', color: C.textSub },
+  ballTextOn: { color: C.green },
   proceedBtn: {
     backgroundColor: C.green, borderRadius: 14, paddingVertical: 16, alignItems: 'center',
     shadowColor: C.green, shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.3, shadowRadius: 12, elevation: 6,

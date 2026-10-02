@@ -1,8 +1,10 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { getApiUrl, fetchWithTimeout } from './server';
+import { getApiUrl, fetchWithTimeout, refreshApiUrl } from './server';
 const DEVICE_KEY = 'cricscore_device_id';
 
 export type LiveRole = 'host' | 'scorer';
+// What a joining phone will do: take over scoring, or be the live-stream camera phone
+export type JoinRole = 'scorer' | 'streamer';
 export type LiveSession = { code: string; token: string; role: LiveRole };
 
 // What gets synced between scorers. `params` are the Scoring screen params for
@@ -26,7 +28,7 @@ export const getDeviceId = async () => {
   return deviceId;
 };
 
-const call = async (method: string, path: string, body?: any) => {
+const call = async (method: string, path: string, body?: any, retried = false): Promise<any> => {
   const base = await getApiUrl();
   let res: Response;
   try {
@@ -36,6 +38,8 @@ const call = async (method: string, path: string, body?: any) => {
       body: body ? JSON.stringify(body) : undefined,
     });
   } catch {
+    // Network changed (e.g. Wi-Fi → 4G)? Find a reachable server and try once more
+    if (!retried && (await refreshApiUrl()) !== base) return call(method, path, body, true);
     throw Object.assign(
       new Error(`Could not reach the CricScore server at ${base.replace(/\/api$/, '')}. Make sure it is running and this phone is on the same Wi-Fi, or change the server address.`),
       { status: 0 },
@@ -51,14 +55,25 @@ export const createLiveSession = async (hostName: string, payload: LivePayload):
   return { code, token, role: 'host' };
 };
 
-export const requestJoin = async (code: string, name: string): Promise<{ requestId: string; hostName: string }> =>
-  call('POST', `/${code.trim().toUpperCase()}/join`, { name, deviceId: await getDeviceId() });
+export const requestJoin = async (code: string, name: string, role: JoinRole = 'scorer'): Promise<{ requestId: string; hostName: string }> =>
+  call('POST', `/${code.trim().toUpperCase()}/join`, { name, role, deviceId: await getDeviceId() });
+
+export const leaveSession = async (code: string, token: string) =>
+  call('POST', `/${code}/leave`, { token, deviceId: await getDeviceId() });
+
+// Built-in camera stream for this match. studioUrl opens the camera studio in the phone's browser
+// (signed in to this match's room only); watchUrl is the link to share with viewers.
+export const getCameraLinks = async (s: LiveSession): Promise<{ roomId: string; studioUrl: string; watchUrl: string }> =>
+  call('POST', `/${s.code}/camera`, { token: s.token });
+
+// Public live-score summary (same feed as the YouTube overlay)
+export const getOverlaySummary = async (code: string) => call('GET', `/${code}/overlay`);
 
 export const getJoinStatus = async (code: string, requestId: string): Promise<{
-  status: 'pending' | 'approved' | 'denied'; token?: string; version?: number; payload?: LivePayload | null;
+  status: 'pending' | 'approved' | 'denied'; role?: JoinRole; token?: string; version?: number; payload?: LivePayload | null;
 }> => call('GET', `/${code}/requests/${requestId}`);
 
-export const getPendingRequests = async (s: LiveSession): Promise<{ id: string; name: string }[]> =>
+export const getPendingRequests = async (s: LiveSession): Promise<{ id: string; name: string; role?: JoinRole }[]> =>
   call('GET', `/${s.code}/requests?token=${s.token}`);
 
 export const respondToRequest = async (s: LiveSession, requestId: string, approve: boolean) =>
@@ -76,7 +91,7 @@ export const pushLiveState = (s: LiveSession, payload: LivePayload): Promise<num
     try {
       return (await call('PUT', `/${s.code}/state`, body)).version as number;
     } catch (e: any) {
-      if (e.status !== 404 || s.role !== 'host') throw e;
+      if (e.status !== 404) throw e;
       await restoreSession(s, payload);
       return (await call('PUT', `/${s.code}/state`, body)).version as number;
     }
@@ -87,10 +102,22 @@ export const pushLiveState = (s: LiveSession, payload: LivePayload): Promise<num
 
 export const pullLiveState = async (s: LiveSession, since: number): Promise<{
   changed: boolean; version: number; payload?: LivePayload; fromMe?: boolean;
+  // Another phone has taken over scoring; this one should stop
+  movedTo?: string | null;
+  streamerName?: string | null;
 }> => {
   const data = await call('GET', `/${s.code}/state?token=${s.token}&since=${since}`);
-  return { ...data, fromMe: data.updatedBy === (await getDeviceId()) };
+  const me = await getDeviceId();
+  return {
+    ...data,
+    fromMe: data.updatedBy === me,
+    movedTo: data.activeDevice && data.activeDevice !== me ? (data.activeName || 'another scorer') : null,
+  };
 };
+
+// Makes this phone the only scorer; the previous scorer's app closes its scoring screen
+export const takeOverScoring = async (s: LiveSession, name: string) =>
+  call('POST', `/${s.code}/takeover`, { token: s.token, deviceId: await getDeviceId(), name });
 
 // Asks the server for the overlay link (it knows the address streaming apps can reach).
 // Makes sure the session exists first, so a server restart doesn't leave a dead link.
@@ -98,7 +125,7 @@ export const getOverlayLink = async (s: LiveSession, payload?: LivePayload): Pro
   try {
     return (await call('GET', `/${s.code}/links`)).overlayUrl;
   } catch (e: any) {
-    if (e.status !== 404 || s.role !== 'host') throw e;
+    if (e.status !== 404) throw e;
     await restoreSession(s, payload);
     return (await call('GET', `/${s.code}/links`)).overlayUrl;
   }

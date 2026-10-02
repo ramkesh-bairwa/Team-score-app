@@ -2,7 +2,7 @@ import React, { useEffect, useRef } from 'react';
 import { Text, StyleSheet, Modal, Animated, Easing, Pressable } from 'react-native';
 
 export type CelebrationKind = 'four' | 'six';
-export type CelebrationEvent = { kind: CelebrationKind; batter: string; id: number };
+export type CelebrationEvent = { kind: CelebrationKind; batter: string; id: number; line?: string };
 
 const DURATION_MS = 3000;
 const BURST = ['🎉', '✨', '🎊', '⭐', '🔥', '🏏', '✨', '🎉'];
@@ -65,7 +65,7 @@ export default function Celebration({ event, onDone }: { event: CelebrationEvent
         </Animated.View>
         <Animated.View style={{ opacity: pop, alignItems: 'center' }}>
           <Text style={s.congrats}>Congratulations {event.batter}! 🎉</Text>
-          <Text style={s.sub}>{th.sub}</Text>
+          <Text style={s.sub}>{event.line || th.sub}</Text>
         </Animated.View>
       </Pressable>
     </Modal>
@@ -87,5 +87,5 @@ const s = StyleSheet.create({
   badgeEmoji: { fontSize: 40, marginBottom: 2 },
   badgeTitle: { fontSize: 46, fontWeight: '900', color: '#fff', letterSpacing: 2 },
   congrats: { marginTop: 34, fontSize: 20, fontWeight: '800', color: '#fff', textAlign: 'center', paddingHorizontal: 24 },
-  sub: { marginTop: 6, fontSize: 14, color: '#CBD5E1', fontWeight: '600' },
+  sub: { marginTop: 8, fontSize: 14, color: '#CBD5E1', fontWeight: '600', textAlign: 'center', paddingHorizontal: 28, lineHeight: 20 },
 });

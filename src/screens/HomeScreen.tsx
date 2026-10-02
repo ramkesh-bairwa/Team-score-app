@@ -5,15 +5,18 @@ import {
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useFocusEffect } from '@react-navigation/native';
-import { getInProgressMatch, clearInProgressMatch, getMatches, getMatchFull } from '../services/api';
-import Config from 'react-native-config';
+import {
+  getInProgressMatch, clearInProgressMatch, listMatches, getMatch, clearMyMatches,
+  pendingMatchCount, syncPendingMatches,
+} from '../services/api';
 import { C } from '../theme/colors';
 import { popup, PopupCard, PopupIcon } from '../components/Popup';
-import { requestJoin, getJoinStatus, LivePayload } from '../services/live';
+import { requestJoin, getJoinStatus, takeOverScoring, LivePayload, LiveSession, JoinRole } from '../services/live';
+import { isServerConfigured, setApiUrl } from '../services/server';
+import { scanQrFromImage } from '../utils/qrScan';
 import ServerSettings from '../components/ServerSettings';
+import { pendingTeamCount, isServerReachable, syncPendingTeams } from '../services/teams';
 
-const DB_RUN = Config.DB_RUN === 'true';
-const HISTORY_KEY = 'cricscore_match_history';
 const SCORER_NAME_KEY = 'cricscore_scorer_name';
 // Wait for a closing popup card to finish animating before opening the next one
 const afterClose = (fn: () => void) => setTimeout(fn, 220);
@@ -26,10 +29,19 @@ export default function HomeScreen({ navigation }: any) {
   const [pwdInput, setPwdInput] = useState('');
   const [joinModal, setJoinModal] = useState(false);
   const [serverModal, setServerModal] = useState(false);
+  // Teams saved offline, shown with a Sync option once the server is reachable
+  const [pendingTeams, setPendingTeams] = useState(0);
+  const [teamsOnline, setTeamsOnline] = useState(false);
+  const [syncingTeams, setSyncingTeams] = useState(false);
+  const [pendingMatches, setPendingMatches] = useState(0);
+  const [historyOffline, setHistoryOffline] = useState(false);
+  const [openingId, setOpeningId] = useState<string | null>(null);
   const [joinCode, setJoinCode] = useState('');
   const [joinName, setJoinName] = useState('');
   const [joinState, setJoinState] = useState<'form' | 'sending' | 'waiting'>('form');
   const [joinHost, setJoinHost] = useState('');
+  const [scanning, setScanning] = useState(false);
+  const [joinRole, setJoinRole] = useState<JoinRole>('streamer');
   const joinPoll = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const stopJoinPoll = () => {
@@ -42,19 +54,60 @@ export default function HomeScreen({ navigation }: any) {
     useCallback(() => {
       loadHistory();
       loadInProgress();
+      checkPendingTeams();
     }, [])
   );
 
+  // Match history comes from the match API (falls back to this phone's copy when offline)
   const loadHistory = async () => {
     try {
-      if (DB_RUN) {
-        const matches = await getMatches();
-        setHistory(matches);
-      } else {
-        const data = await AsyncStorage.getItem(HISTORY_KEY);
-        setHistory(data ? JSON.parse(data) : []);
-      }
+      const r = await listMatches();
+      setHistory(r.matches);
+      setHistoryOffline(r.offline);
     } catch (_) {}
+  };
+
+  // Teams and matches saved while offline; matches upload by themselves once the server is reachable
+  const checkPendingTeams = async () => {
+    const n = await pendingTeamCount();
+    const m = await pendingMatchCount();
+    setPendingTeams(n);
+    setPendingMatches(m);
+    if (n || m) {
+      const online = await isServerReachable();
+      setTeamsOnline(online);
+      if (online && m) {
+        await syncPendingMatches().catch(() => null);
+        setPendingMatches(await pendingMatchCount());
+        loadHistory();
+      }
+    }
+  };
+
+  // Re-check every 15s while something is waiting, so Sync appears as soon as the net is back
+  useEffect(() => {
+    if ((!pendingTeams && !pendingMatches) || teamsOnline) return;
+    const t = setInterval(checkPendingTeams, 15000);
+    return () => clearInterval(t);
+  }, [pendingTeams, pendingMatches, teamsOnline]);
+
+  const syncTeams = async () => {
+    setSyncingTeams(true);
+    try {
+      const m = await syncPendingMatches().catch(() => ({ synced: 0, offline: true }));
+      const r = await syncPendingTeams();
+      if (m.synced) loadHistory();
+      if (r.failed.length) {
+        popup.alert('Synced With Problems', `Synced ${r.synced}.\n\n${r.failed.map(f => `• ${f.name}: ${f.error}`).join('\n')}`, undefined, 'warning');
+      } else if (r.offline) {
+        popup.alert('Sync Paused', `Synced ${r.synced}. The connection dropped; try again later.`, undefined, 'warning');
+      } else {
+        popup.alert('Teams Synced', `${r.synced} team change${r.synced === 1 ? '' : 's'} uploaded for everyone.`, undefined, 'success');
+      }
+    } finally {
+      setSyncingTeams(false);
+      checkPendingTeams();
+    }
   };
 
   const loadInProgress = async () => {
@@ -81,6 +134,8 @@ export default function HomeScreen({ navigation }: any) {
       tossWinner: inProgress.tossWinner,
       tossChoice: inProgress.tossChoice,
       live: inProgress.live,
+      matchId: inProgress.matchId,
+      matchKey: inProgress.matchKey,
     });
   };
 
@@ -96,10 +151,17 @@ export default function HomeScreen({ navigation }: any) {
     setJoinModal(false);
   };
 
-  const enterLiveMatch = (code: string, token: string, payload: LivePayload | null | undefined) => {
-    const live = { code, token, role: 'scorer' };
+  const enterLiveMatch = async (code: string, token: string, name: string, payload: LivePayload | null | undefined) => {
+    const live: LiveSession = { code, token, role: 'scorer' };
     if (!payload) {
       popup.alert('Match Not Started', 'The scorer has not started scoring yet. Try joining again in a moment.', undefined, 'warning');
+      return;
+    }
+    // This phone becomes the only scorer; the other phone's scoring closes
+    try {
+      await takeOverScoring(live, name);
+    } catch (e: any) {
+      popup.alert('Could Not Start Scoring', e.message, undefined, 'error');
       return;
     }
     if (payload.phase === 'innings_end') {
@@ -109,15 +171,24 @@ export default function HomeScreen({ navigation }: any) {
     }
   };
 
-  const submitJoin = async () => {
-    const code = joinCode.trim().toUpperCase();
+  const submitJoin = async (codeArg?: string, roleArg?: JoinRole) => {
+    const code = (codeArg ?? joinCode).trim().toUpperCase();
+    const role = roleArg ?? joinRole;
     const name = joinName.trim();
     if (code.length !== 6) { popup.alert('Invalid Code', 'Enter the 6-character match code shown on the scorer\'s phone.', undefined, 'warning'); return; }
     if (!name) { popup.alert('Name Required', 'Enter your name so the scorer knows who is asking.', undefined, 'warning'); return; }
+    if (!(await isServerConfigured())) {
+      popup.show({
+        type: 'warning', icon: '🖥️', title: 'Set Server Address',
+        message: 'Scan the QR code instead (it sets the server automatically), or enter the server address first.',
+        buttons: [{ text: 'Cancel', style: 'cancel' }, { text: 'Set Address', onPress: () => setServerModal(true) }],
+      });
+      return;
+    }
     setJoinState('sending');
     AsyncStorage.setItem(SCORER_NAME_KEY, name).catch(() => {});
     try {
-      const { requestId, hostName } = await requestJoin(code, name);
+      const { requestId, hostName } = await requestJoin(code, name, role);
       setJoinHost(hostName);
       setJoinState('waiting');
       stopJoinPoll();
@@ -128,10 +199,17 @@ export default function HomeScreen({ navigation }: any) {
           stopJoinPoll();
           setJoinModal(false);
           afterClose(() => {
-            if (st.status === 'approved') {
+            if (st.status === 'approved' && st.role === 'streamer') {
               popup.show({
-                type: 'success', title: 'Access Granted', message: `${hostName} approved your request. You can now score this match.`,
-                buttons: [{ text: 'Start Scoring', onPress: () => enterLiveMatch(code, st.token!, st.payload) }],
+                type: 'success', icon: '📺', title: 'Connected as Live Stream',
+                message: `${hostName} approved this phone as the live-stream device. You'll see the score in real time and can go live on YouTube.`,
+                buttons: [{ text: 'Open Live Stream', onPress: () => navigation.navigate('LiveStream', { code, token: st.token, name }) }],
+              });
+            } else if (st.status === 'approved') {
+              popup.show({
+                type: 'success', title: 'Access Granted',
+                message: `${hostName} approved your request. When you start, scoring moves to this phone and closes on theirs.`,
+                buttons: [{ text: 'Start Scoring', onPress: () => enterLiveMatch(code, st.token!, name, st.payload) }],
               });
             } else {
               popup.alert('Access Denied', `${hostName} did not allow you to score this match.`, undefined, 'error');
@@ -146,6 +224,24 @@ export default function HomeScreen({ navigation }: any) {
     } catch (e: any) {
       setJoinState('form');
       popup.alert('Could Not Join', e.message, undefined, 'error');
+    }
+  };
+
+  const scanJoin = async (source: 'camera' | 'gallery') => {
+    setScanning(true);
+    try {
+      const link = await scanQrFromImage(source);
+      if (!link) return;
+      // The QR carries the server address, so the joining phone needs no setup
+      if (link.server) await setApiUrl(link.server);
+      setJoinCode(link.code);
+      if (link.role) setJoinRole(link.role);
+      if (joinName.trim()) submitJoin(link.code, link.role);
+      else popup.alert('Code Scanned ✅', `Match ${link.code} found. Enter your name and tap Request Access.`, undefined, 'success');
+    } catch (e: any) {
+      popup.alert('Scan Failed', e.message, undefined, 'error');
+    } finally {
+      setScanning(false);
     }
   };
 
@@ -175,7 +271,7 @@ export default function HomeScreen({ navigation }: any) {
       { text: 'Cancel', style: 'cancel' },
       {
         text: 'Clear', style: 'destructive', onPress: async () => {
-          await AsyncStorage.removeItem(HISTORY_KEY);
+          await clearMyMatches();
           setHistory([]);
         },
       },
@@ -212,6 +308,36 @@ export default function HomeScreen({ navigation }: any) {
         <View style={s.startBannerBtn}>
           <Text style={s.startBannerBtnText}>▶</Text>
         </View>
+      </TouchableOpacity>
+
+      {/* Offline team changes waiting to sync */}
+      {pendingTeams + pendingMatches > 0 && (
+        <View style={[s.syncBanner, !teamsOnline && s.syncBannerOff]}>
+          <Text style={s.syncBannerText}>
+            {(() => {
+              const parts = [
+                pendingTeams ? `${pendingTeams} team change${pendingTeams === 1 ? '' : 's'}` : '',
+                pendingMatches ? `${pendingMatches} match${pendingMatches === 1 ? '' : 'es'}` : '',
+              ].filter(Boolean).join(' + ');
+              return teamsOnline ? `☁️ ${parts} ready to sync` : `📴 ${parts} saved offline`;
+            })()}
+          </Text>
+          {teamsOnline && (
+            <TouchableOpacity style={s.syncBannerBtn} onPress={syncTeams} disabled={syncingTeams}>
+              {syncingTeams ? <ActivityIndicator color={C.white} size="small" /> : <Text style={s.syncBannerBtnText}>Sync</Text>}
+            </TouchableOpacity>
+          )}
+        </View>
+      )}
+
+      {/* Shared teams */}
+      <TouchableOpacity style={[s.joinBanner, s.teamsBanner]} onPress={() => navigation.navigate('Teams')}>
+        <Text style={s.joinIcon}>👥</Text>
+        <View style={{ flex: 1 }}>
+          <Text style={[s.joinTitle, s.teamsTitle]}>Teams</Text>
+          <Text style={s.joinSub}>Create a team once, everyone can play with it</Text>
+        </View>
+        <Text style={[s.joinArrow, s.teamsTitle]}>›</Text>
       </TouchableOpacity>
 
       {/* Join someone else's match */}
@@ -253,6 +379,7 @@ export default function HomeScreen({ navigation }: any) {
         )}
 
         <Text style={s.sectionTitle}>📋 Match History ({history.length})</Text>
+        {historyOffline && <Text style={s.offlineNote}>📴 Offline · showing matches saved on this phone</Text>}
 
         {history.length === 0 ? (
           <View style={s.emptyBox}>
@@ -266,60 +393,57 @@ export default function HomeScreen({ navigation }: any) {
               key={m.id}
               style={s.matchCard}
               onPress={async () => {
-                let matchData = m;
-                if (DB_RUN && (!m.innings1)) {
-                  try {
-                    const full = await getMatchFull(m.id);
-                    if (full) {
-                      const inn1 = full.innings?.find((i: any) => i.innings_number === 1);
-                      const inn2 = full.innings?.find((i: any) => i.innings_number === 2);
-                      const mapInnings = (inn: any) => inn ? ({
-                        runs: inn.total_runs, wickets: inn.total_wickets,
-                        overs: inn.overs_played, balls: inn.balls_played,
-                        batters: (inn.batters || []).map((b: any) => ({ name: b.player_name, runs: b.runs, balls: b.balls, fours: b.fours, sixes: b.sixes, out: b.is_out })),
-                        bowlers: (inn.bowlers || []).map((b: any) => ({ name: b.player_name, overs: b.overs, balls: b.balls, runs: b.runs, wickets: b.wickets })),
-                      }) : null;
-                      matchData = {
-                        ...m,
-                        battingTeam: { name: full.team1_name, players: [], captain: '' },
-                        fieldingTeam: { name: full.team2_name, players: [], captain: '' },
-                        matchType: full.match_type,
-                        innings1: mapInnings(inn1),
-                        innings2: mapInnings(inn2),
-                      };
-                    }
-                  } catch (_) {}
+                // Full match (innings + ball-by-ball) from this phone's copy or the match API
+                setOpeningId(m.id);
+                try {
+                  const full = await getMatch(m.id);
+                  if (!full?.innings1) {
+                    popup.alert('Match In Progress', 'The scorecard is available once the first innings is complete.', undefined, 'info');
+                    return;
+                  }
+                  navigation.navigate('Scorecard', {
+                    battingTeam: full.team1,
+                    fieldingTeam: full.team2,
+                    overs: full.overs,
+                    matchType: full.matchType,
+                    location: full.location,
+                    tossWinner: full.tossWinner,
+                    tossChoice: full.tossChoice,
+                    innings1: full.innings1,
+                    innings2: full.innings2 || null,
+                    isFirstInnings: !full.innings2,
+                    liveView: false,
+                    fromHistory: true,
+                    bet: full.bet || null,
+                  });
+                } catch (e: any) {
+                  popup.alert('Could Not Open Match', e.message, undefined, 'error');
+                } finally {
+                  setOpeningId(null);
                 }
-                if (!matchData.innings1) return;
-                navigation.navigate('Scorecard', {
-                  battingTeam: matchData.battingTeam,
-                  fieldingTeam: matchData.fieldingTeam,
-                  overs: matchData.overs,
-                  matchType: matchData.matchType,
-                  location: matchData.location,
-                  innings1: matchData.innings1,
-                  innings2: matchData.innings2 || null,
-                  isFirstInnings: !matchData.innings2,
-                  liveView: false,
-                  fromHistory: true,
-                  bet: matchData.bet || null,
-                });
               }}>
               <View style={s.matchCardTop}>
-                <View style={[s.statusChip, m.status === 'completed' ? s.completedChip : s.firstInningsChip]}>
-                  <Text style={[s.statusChipText, m.status === 'completed' ? s.completedChipText : s.firstInningsChipText]}>
-                    {m.status === 'completed' ? 'COMPLETED' : 'IN PROGRESS'}
-                  </Text>
+                <View style={s.chipRow}>
+                  <View style={[s.statusChip, m.status === 'completed' ? s.completedChip : s.firstInningsChip]}>
+                    <Text style={[s.statusChipText, m.status === 'completed' ? s.completedChipText : s.firstInningsChipText]}>
+                      {m.status === 'completed' ? 'COMPLETED' : m.status === 'innings_break' ? 'INNINGS BREAK' : 'LIVE'}
+                    </Text>
+                  </View>
+                  {m.pending && <Text style={s.pendingChip}>NOT UPLOADED</Text>}
                 </View>
                 <Text style={s.matchDate}>{m.date}</Text>
               </View>
               <Text style={s.matchTeams}>{m.team1} vs {m.team2}</Text>
-              <View style={s.matchScoreRow}>
-                <Text style={s.matchScore}>{m.score}</Text>
-                <Text style={s.matchOvers}>({m.oversPlayed} ov) · {m.overs} ov match</Text>
-              </View>
+              {!!m.score && (
+                <View style={s.matchScoreRow}>
+                  <Text style={s.matchScore}>{m.score}</Text>
+                  <Text style={s.matchOvers}>({m.oversPlayed} ov){m.score2 ? `  ·  ${m.team2} ${m.score2} (${m.oversPlayed2})` : ''}</Text>
+                </View>
+              )}
               {m.result ? <Text style={s.matchResult}>🏆 {m.result}</Text> : null}
-              <Text style={s.viewDetail}>Tap to view scorecard →</Text>
+              <Text style={s.viewDetail}>
+                {openingId === m.id ? 'Opening…' : `${m.overs} ov${m.ballType ? ` · ${m.ballType} ball` : ''} · Tap to view scorecard →`}
+              </Text>
             </TouchableOpacity>
           ))
         )}
@@ -369,7 +493,18 @@ export default function HomeScreen({ navigation }: any) {
           <>
             <PopupIcon type="info" icon="🔗" />
             <Text style={s.modalTitle}>Join a Match</Text>
-            <Text style={s.modalSub}>Enter the code shown on the scorer's phone. They will need to allow you.</Text>
+            <Text style={s.modalSub}>Scan the scorer's QR code or type their code. They will need to allow you.</Text>
+            <View style={s.scanRow}>
+              <TouchableOpacity style={s.scanBtn} onPress={() => scanJoin('camera')} disabled={scanning}>
+                {scanning ? <ActivityIndicator color={C.white} /> : <Text style={s.scanBtnText}>📷  Scan QR</Text>}
+              </TouchableOpacity>
+              <TouchableOpacity style={[s.scanBtn, s.scanBtnGhost]} onPress={() => scanJoin('gallery')} disabled={scanning}>
+                <Text style={[s.scanBtnText, s.scanBtnGhostText]}>🖼️  From Photo</Text>
+              </TouchableOpacity>
+            </View>
+            <View style={s.orRow}>
+              <View style={s.orLine} /><Text style={s.orText}>or enter code</Text><View style={s.orLine} />
+            </View>
             <TextInput
               style={[s.modalInput, s.codeInput]}
               placeholder="ABC123"
@@ -379,7 +514,6 @@ export default function HomeScreen({ navigation }: any) {
               maxLength={6}
               value={joinCode}
               onChangeText={v => setJoinCode(v.replace(/[^a-zA-Z0-9]/g, '').toUpperCase())}
-              autoFocus
             />
             <TextInput
               style={s.modalInput}
@@ -388,11 +522,23 @@ export default function HomeScreen({ navigation }: any) {
               value={joinName}
               onChangeText={setJoinName}
             />
+            <Text style={s.roleLabel}>THIS PHONE WILL</Text>
+            <View style={s.roleRow}>
+              {([
+                { key: 'streamer', title: '📺 Live Stream', sub: 'Camera + YouTube' },
+                { key: 'scorer', title: '🏏 Take Over Scoring', sub: 'Other phone stops' },
+              ] as const).map(r => (
+                <TouchableOpacity key={r.key} style={[s.roleBtn, joinRole === r.key && s.roleBtnOn]} onPress={() => setJoinRole(r.key)}>
+                  <Text style={[s.roleTitle, joinRole === r.key && s.roleTitleOn]}>{r.title}</Text>
+                  <Text style={s.roleSub}>{r.sub}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
             <View style={s.modalBtnRow}>
               <TouchableOpacity style={s.modalCancelBtn} onPress={closeJoin}>
                 <Text style={s.modalCancelText}>Cancel</Text>
               </TouchableOpacity>
-              <TouchableOpacity style={[s.modalConfirmBtn, { backgroundColor: C.accent }]} onPress={submitJoin} disabled={joinState === 'sending'}>
+              <TouchableOpacity style={[s.modalConfirmBtn, { backgroundColor: C.accent }]} onPress={() => submitJoin()} disabled={joinState === 'sending'}>
                 {joinState === 'sending'
                   ? <ActivityIndicator color={C.white} />
                   : <Text style={s.modalConfirmText}>Request Access</Text>}
@@ -491,6 +637,20 @@ const s = StyleSheet.create({
     borderWidth: 1, borderColor: C.accent + '30',
   },
   joinIcon: { fontSize: 22 },
+  chipRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  pendingChip: { fontSize: 9, fontWeight: '900', color: C.orange, backgroundColor: C.orangeLight, paddingHorizontal: 6, paddingVertical: 3, borderRadius: 6, overflow: 'hidden' },
+  offlineNote: { fontSize: 12, fontWeight: '700', color: C.orange, marginBottom: 8 },
+  syncBanner: {
+    marginHorizontal: 16, marginTop: 10, flexDirection: 'row', alignItems: 'center', gap: 10,
+    backgroundColor: C.accentLight, borderRadius: 14, paddingVertical: 10, paddingHorizontal: 14,
+    borderWidth: 1, borderColor: C.accent + '40',
+  },
+  syncBannerOff: { backgroundColor: C.orangeLight, borderColor: C.orange + '40' },
+  syncBannerText: { flex: 1, fontSize: 13, fontWeight: '800', color: C.text },
+  syncBannerBtn: { backgroundColor: C.accent, borderRadius: 10, paddingHorizontal: 16, paddingVertical: 7, minWidth: 64, alignItems: 'center' },
+  syncBannerBtnText: { color: C.white, fontSize: 13, fontWeight: '900' },
+  teamsBanner: { borderColor: C.green + '40' },
+  teamsTitle: { color: C.green },
   joinTitle: { fontSize: 14, fontWeight: '800', color: C.accent },
   joinSub: { fontSize: 12, color: C.textSub, marginTop: 1 },
   joinArrow: { fontSize: 26, color: C.accent, fontWeight: '300' },
@@ -500,6 +660,21 @@ const s = StyleSheet.create({
     alignSelf: 'stretch', backgroundColor: C.bg, borderRadius: 12, paddingHorizontal: 14, paddingVertical: 12,
     fontSize: 15, color: C.text, borderWidth: 1, borderColor: C.cardBorder, marginBottom: 12,
   },
+  roleLabel: { alignSelf: 'flex-start', fontSize: 10, fontWeight: '900', color: C.textMuted, letterSpacing: 1, marginBottom: 6 },
+  roleRow: { flexDirection: 'row', gap: 8, alignSelf: 'stretch', marginBottom: 12 },
+  roleBtn: { flex: 1, borderRadius: 12, padding: 10, borderWidth: 1.5, borderColor: C.cardBorder, backgroundColor: C.bg },
+  roleBtnOn: { borderColor: C.accent, backgroundColor: C.accentLight },
+  roleTitle: { fontSize: 12, fontWeight: '900', color: C.textSub },
+  roleTitleOn: { color: C.accent },
+  roleSub: { fontSize: 10, color: C.textMuted, marginTop: 2 },
+  scanRow: { flexDirection: 'row', gap: 10, alignSelf: 'stretch' },
+  scanBtn: { flex: 1, backgroundColor: C.text, borderRadius: 12, paddingVertical: 13, alignItems: 'center' },
+  scanBtnGhost: { backgroundColor: C.divider, borderWidth: 1, borderColor: C.cardBorder },
+  scanBtnText: { color: C.white, fontSize: 14, fontWeight: '800' },
+  scanBtnGhostText: { color: C.text },
+  orRow: { flexDirection: 'row', alignItems: 'center', gap: 10, alignSelf: 'stretch', marginVertical: 12 },
+  orLine: { flex: 1, height: 1, backgroundColor: C.cardBorder },
+  orText: { fontSize: 11, color: C.textMuted, fontWeight: '700' },
   codeInput: { fontSize: 24, fontWeight: '900', letterSpacing: 8, textAlign: 'center' },
   modalBtnRow: { flexDirection: 'row', gap: 10, alignSelf: 'stretch', marginTop: 6 },
   modalConfirmBtn: { flex: 1, backgroundColor: C.primary, borderRadius: 14, paddingVertical: 13, alignItems: 'center' },

@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, StatusBar, ScrollView } from 'react-native';
 import { C } from '../theme/colors';
+import { newMatchIdentity } from '../services/api';
 
 export default function TossScreen({ navigation, route }: any) {
   const { team1, team2, overs, matchType, bet, location } = route.params;
@@ -16,6 +17,7 @@ export default function TossScreen({ navigation, route }: any) {
     navigation.navigate('Scoring', {
       battingTeam, fieldingTeam, overs, matchType, location, bet,
       tossWinner: tossTeam.name, tossChoice: choice,
+      ...newMatchIdentity(), // matchId + matchKey for the match API
     });
   };
 

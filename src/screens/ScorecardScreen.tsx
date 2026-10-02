@@ -4,8 +4,11 @@ import {
 } from 'react-native';
 import { launchCamera } from 'react-native-image-picker';
 import { useIsFocused } from '@react-navigation/native';
-import { saveMatch as saveMatchApi, saveInProgressMatch, getStorageMode } from '../services/api';
+import { saveInProgressMatch, upsertMatch } from '../services/api';
 import { pullLiveState } from '../services/live';
+import { popup } from '../components/Popup';
+import InningsScorecard from '../components/InningsScorecard';
+import CommentaryList from '../components/CommentaryList';
 import { C } from '../theme/colors';
 
 function BetSettlement({ resultText, battingTeam, fieldingTeam, bet, cap1PayPhoto, cap2PayPhoto, takePayPhoto }: any) {
@@ -114,17 +117,51 @@ function BetSettlement({ resultText, battingTeam, fieldingTeam, bet, cap1PayPhot
   );
 }
 
+// "Loser to pay": the losing team covers the itemized match expenses
+function LoserSettlement({ resultText, battingTeam, fieldingTeam, bet }: any) {
+  const isTied = resultText === 'Match Tied!';
+  const loser = isTied ? null : resultText.startsWith(battingTeam.name) ? fieldingTeam : battingTeam;
+  return (
+    <View style={s.expenseCard}>
+      <View style={s.expenseHead}>
+        <Text style={s.expenseIcon}>🧾</Text>
+        <View style={{ flex: 1 }}>
+          <Text style={s.expenseTitle}>Loser to Pay</Text>
+          <Text style={s.expenseSub}>Match expenses</Text>
+        </View>
+        <Text style={s.expenseTotal}>₹{bet.amount}</Text>
+      </View>
+      {(bet.expenses || []).map((e: any, i: number) => (
+        <View key={i} style={s.expenseRow}>
+          <Text style={s.expenseItem}>{e.label}</Text>
+          <Text style={s.expenseAmt}>₹{e.amount}</Text>
+        </View>
+      ))}
+      {!!bet.note && <Text style={s.expenseNote}>📝 {bet.note}</Text>}
+      <View style={[s.expenseVerdict, isTied && s.expenseVerdictTie]}>
+        <Text style={[s.expenseVerdictText, isTied && s.expenseVerdictTextTie]}>
+          {isTied
+            ? `🤝 Match tied: both teams share ₹${bet.amount} (₹${Math.round(bet.amount / 2)} each)`
+            : `💸 ${loser.name} pays ₹${bet.amount}${loser.captain ? ` (captain ${loser.captain})` : ''}`}
+        </Text>
+      </View>
+    </View>
+  );
+}
+
 export default function ScorecardScreen({ navigation, route }: any) {
   const {
     battingTeam, fieldingTeam, overs, innings1,
     isFirstInnings, liveView, innings2, matchType,
     fromHistory, bet, location, tossWinner, tossChoice,
-    live, liveMirror,
+    live, liveMirror, matchId, matchKey,
   } = route.params;
   const isFocused = useIsFocused();
   const liveVersion = useRef(0);
 
-  const oversDisplay = `${innings1.overs}.${innings1.balls}`;
+  // Team that batted first is always `battingTeam` here
+  const [tab, setTab] = useState<1 | 2>(innings2 ? 2 : 1);
+  const [view, setView] = useState<'card' | 'log'>('card');
 
   let resultText = '';
   if (!isFirstInnings && innings2) {
@@ -155,7 +192,17 @@ export default function ScorecardScreen({ navigation, route }: any) {
     const tick = async () => {
       try {
         const r = await pullLiveState(live, liveVersion.current);
-        if (stopped || !r.changed) return;
+        if (stopped) return;
+        if (r.movedTo) {
+          stopped = true;
+          popup.show({
+            type: 'info', icon: '📲', dismissable: false, title: 'Scoring Moved',
+            message: `${r.movedTo} is now scoring this match on their phone, so scoring on this phone is closed.`,
+            buttons: [{ text: 'OK', onPress: () => navigation.navigate('Home') }],
+          });
+          return;
+        }
+        if (!r.changed) return;
         liveVersion.current = r.version;
         const p = r.payload;
         if (r.fromMe || !p || p.inningsNum !== 2) return;
@@ -171,16 +218,12 @@ export default function ScorecardScreen({ navigation, route }: any) {
     return () => { stopped = true; clearInterval(id); };
   }, [isFocused]);
 
+  // Match API: the phone that finished the match saves the result (other connected phones skip)
   const saveResult = async () => {
-    // With a central server, only the phone that finished the match uploads it
-    if (liveMirror && (await getStorageMode()) === 'central') return;
-    saveMatchApi({
-      battingTeam, fieldingTeam, overs, matchType, location,
-      tossWinner: tossWinner || '',
-      tossChoice: tossChoice || '',
-      betAmount: bet?.amount || 0,
-      bet: bet || null,
-      innings1, innings2, result: resultText,
+    if (liveMirror || !matchId) return;
+    upsertMatch(matchId, matchKey, {
+      team1: battingTeam, team2: fieldingTeam, overs, matchType, location, bet,
+      tossWinner, tossChoice, innings1, innings2, result: resultText, status: 'completed',
     }).catch(() => {});
   };
 
@@ -194,45 +237,108 @@ export default function ScorecardScreen({ navigation, route }: any) {
   };
 
   const hasBet = bet?.type === 'paid' && bet?.amount > 0;
+  const isLoserPays = bet?.type === 'loser' && bet?.amount > 0;
+
+  const abbr = (name: string) => {
+    const words = name.trim().split(/\s+/);
+    return (words.length > 1 ? words.map(w => w[0]).join('') : name).slice(0, 3).toUpperCase();
+  };
+  const winner = resultText && resultText !== 'Match Tied!'
+    ? (resultText.startsWith(battingTeam.name) ? battingTeam.name : fieldingTeam.name) : null;
+
+  let statusLabel = 'RESULT';
+  let statusLine = resultText;
+  if (liveView) {
+    statusLabel = 'LIVE';
+    if (innings2) {
+      const need = Math.max(0, innings1.runs + 1 - innings2.runs);
+      const left = Math.max(0, overs * 6 - (innings2.overs * 6 + innings2.balls));
+      statusLine = `${fieldingTeam.name} need ${need} run${need === 1 ? '' : 's'} in ${left} ball${left === 1 ? '' : 's'}`;
+    } else {
+      const b = innings1.overs * 6 + innings1.balls;
+      statusLine = `${battingTeam.name} batting · CRR ${b ? ((innings1.runs / b) * 6).toFixed(2) : '0.00'}`;
+    }
+  } else if (isFirstInnings) {
+    statusLabel = 'INNINGS BREAK';
+    statusLine = `${fieldingTeam.name} need ${innings1.runs + 1} runs to win`;
+  }
+  const tossLine = tossWinner
+    ? `${tossWinner} won the toss and chose to ${tossChoice === 'bat' ? 'bat' : 'bowl'} first`
+    : '';
+
+  const teamRows = [
+    { team: battingTeam, inn: innings1, n: 1 as const },
+    { team: fieldingTeam, inn: innings2, n: 2 as const },
+  ];
 
   return (
     <View style={s.container}>
       <StatusBar barStyle="dark-content" backgroundColor={C.white} />
       <View style={s.header}>
-        <TouchableOpacity onPress={() => navigation.goBack()}>
-          <Text style={s.back}>← {liveView ? 'Back to Match' : 'Back'}</Text>
+        <TouchableOpacity onPress={() => navigation.goBack()} style={s.backBtn}>
+          <Text style={s.back}>←</Text>
         </TouchableOpacity>
-        <Text style={s.headerTitle}>Scorecard</Text>
-        <View style={{ width: 80 }} />
+        <View style={s.headerMid}>
+          <Text style={s.headerTitle} numberOfLines={1}>{battingTeam.name} vs {fieldingTeam.name}</Text>
+          <Text style={s.headerSub}>Scorecard</Text>
+        </View>
+        <View style={s.backBtn} />
       </View>
 
       <ScrollView contentContainerStyle={s.scroll}>
-        {/* Summary */}
-        <View style={s.summaryCard}>
-          <Text style={s.matchTitle}>{battingTeam.name} vs {fieldingTeam.name}</Text>
-          <Text style={s.matchSub}>
-            {overs} Overs · {matchType === 'local' ? '🏘️ Local' : '🏟️ Domestic'}
-            {location ? `  📍 ${location}` : ''}
-          </Text>
-          <View style={s.scoreBox}>
-            <Text style={s.bigScore}>{innings1.runs}/{innings1.wickets}</Text>
-            <Text style={s.bigOvers}>({oversDisplay} ov)</Text>
+        {/* Match summary */}
+        <View style={s.summary}>
+          <View style={s.summaryTop}>
+            <Text style={s.summaryMeta} numberOfLines={1}>
+              {overs} OVERS · {matchType === 'local' ? 'LOCAL' : 'DOMESTIC'}
+              {bet?.ballType ? ` · ${String(bet.ballType).toUpperCase()} BALL` : ''}
+              {location ? ` · ${location.toUpperCase()}` : ''}
+            </Text>
+            <View style={[s.statusPill, liveView && s.statusPillLive, statusLabel === 'INNINGS BREAK' && s.statusPillBreak]}>
+              {liveView && <View style={s.liveDot} />}
+              <Text style={s.statusPillText}>{statusLabel}</Text>
+            </View>
           </View>
-          {innings2 && (
-            <Text style={s.score2nd}>
-              {fieldingTeam.name}: {innings2.runs}/{innings2.wickets} ({innings2.overs}.{innings2.balls} ov)
+
+          {teamRows.map(({ team, inn, n }) => {
+            const dim = !!winner && winner !== team.name;
+            return (
+              <View key={n} style={s.teamRow}>
+                <View style={[s.badge, n === 2 && s.badge2]}><Text style={s.badgeText}>{abbr(team.name)}</Text></View>
+                <Text style={[s.teamName, dim && s.dim]} numberOfLines={1}>{team.name}</Text>
+                {inn ? (
+                  <Text style={[s.teamScore, dim && s.dim]}>
+                    {inn.runs}/{inn.wickets}
+                    <Text style={s.teamOvers}>  ({inn.overs}.{inn.balls})</Text>
+                  </Text>
+                ) : (
+                  <Text style={s.yetToBat}>Yet to bat</Text>
+                )}
+              </View>
+            );
+          })}
+
+          {!!statusLine && (
+            <Text style={[s.statusLine, resultText ? s.statusWin : liveView ? s.statusLive : s.statusBreak]}>
+              {resultText ? '🏆 ' : ''}{statusLine}
             </Text>
           )}
-          <View style={[s.resultBox,
-            liveView ? { backgroundColor: '#ff000030' } :
-            resultText ? { backgroundColor: C.greenLight } : {}]}>
-            <Text style={[s.resultText,
-              liveView ? { color: '#cc0000' } :
-              resultText ? { color: C.green } : { color: C.white }]}>
-              {liveView ? '🔴 LIVE' : resultText ? `🏆 ${resultText}` : '🏏 1st Innings Complete'}
-            </Text>
-          </View>
+          {!!tossLine && <Text style={s.toss}>🪙 {tossLine}</Text>}
         </View>
+
+        {/* Live-streamed match: innings video, ball-by-ball replays and the live stream, in the app */}
+        {!!live?.code && (
+          <TouchableOpacity
+            style={s.videoBtn}
+            onPress={() => navigation.navigate('MatchVideo', { code: live.code, title: `${battingTeam.name} vs ${fieldingTeam.name}` })}>
+            <Text style={s.videoBtnIcon}>▶</Text>
+            <View style={{ flex: 1 }}>
+              <Text style={s.videoBtnTitle}>{isFirstInnings ? 'Watch the innings video' : 'Watch match videos'}</Text>
+              <Text style={s.videoBtnSub}>Innings videos · ball-by-ball replays · full match</Text>
+            </View>
+            <Text style={s.videoBtnArrow}>›</Text>
+          </TouchableOpacity>
+        )}
 
         {/* Bet Settlement */}
         {!liveView && !isFirstInnings && hasBet && (
@@ -247,113 +353,57 @@ export default function ScorecardScreen({ navigation, route }: any) {
           />
         )}
 
-        {/* 1st Innings Batting */}
-        <View style={s.card}>
-          <Text style={s.cardTitle}>🏏 {battingTeam.name} Batting</Text>
-          <View style={s.tableHeader}>
-            <Text style={s.colBatter}>Batter</Text>
-            <Text style={s.colStat}>R</Text><Text style={s.colStat}>B</Text>
-            <Text style={s.colStat}>4s</Text><Text style={s.colStat}>6s</Text>
-            <Text style={s.colStat}>SR</Text>
-          </View>
-          {innings1.batters.map((b: any, i: number) => (
-            <View key={i} style={[s.tableRow, b.out && s.tableRowOut]}>
-              <View style={s.colBatterWrap}>
-                <Text style={[s.batterName, !b.out && s.batterNameActive]}>{b.name}</Text>
-                {b.name === battingTeam.captain && <Text style={s.capBadge}>©</Text>}
-                {b.out ? <Text style={s.outLabel}>out</Text> : <Text style={s.notOutLabel}>not out</Text>}
-              </View>
-              <Text style={s.colStat}>{b.runs}</Text>
-              <Text style={s.colStat}>{b.balls}</Text>
-              <Text style={s.colStat}>{b.fours}</Text>
-              <Text style={s.colStat}>{b.sixes}</Text>
-              <Text style={s.colStat}>{b.balls > 0 ? ((b.runs / b.balls) * 100).toFixed(0) : '-'}</Text>
-            </View>
-          ))}
-          <View style={s.totalRow}>
-            <Text style={s.totalLabel}>Total</Text>
-            <Text style={s.totalVal}>{innings1.runs}/{innings1.wickets} ({oversDisplay} ov)</Text>
-          </View>
-        </View>
-
-        {/* 1st Innings Bowling */}
-        <View style={s.card}>
-          <Text style={s.cardTitle}>🎳 {fieldingTeam.name} Bowling</Text>
-          <View style={s.tableHeader}>
-            <Text style={s.colBatter}>Bowler</Text>
-            <Text style={s.colStat}>O</Text><Text style={s.colStat}>R</Text>
-            <Text style={s.colStat}>W</Text><Text style={s.colStat}>Eco</Text>
-          </View>
-          {innings1.bowlers.map((b: any, i: number) => (
-            <View key={i} style={s.tableRow}>
-              <View style={s.colBatterWrap}>
-                <Text style={s.batterName}>{b.name}</Text>
-                {b.name === fieldingTeam.captain && <Text style={s.capBadge}>©</Text>}
-              </View>
-              <Text style={s.colStat}>{b.overs}.{b.balls}</Text>
-              <Text style={s.colStat}>{b.runs}</Text>
-              <Text style={[s.colStat, b.wickets > 0 && s.wicketStat]}>{b.wickets}</Text>
-              <Text style={s.colStat}>
-                {(b.overs * 6 + b.balls) > 0 ? (b.runs / ((b.overs * 6 + b.balls) / 6)).toFixed(1) : '-'}
-              </Text>
-            </View>
-          ))}
-        </View>
-
-        {/* 2nd Innings */}
-        {innings2 && (
-          <>
-            <View style={s.card}>
-              <Text style={s.cardTitle}>🏏 {fieldingTeam.name} Batting (2nd Innings)</Text>
-              <View style={s.tableHeader}>
-                <Text style={s.colBatter}>Batter</Text>
-                <Text style={s.colStat}>R</Text><Text style={s.colStat}>B</Text>
-                <Text style={s.colStat}>4s</Text><Text style={s.colStat}>6s</Text>
-                <Text style={s.colStat}>SR</Text>
-              </View>
-              {innings2.batters.map((b: any, i: number) => (
-                <View key={i} style={[s.tableRow, b.out && s.tableRowOut]}>
-                  <View style={s.colBatterWrap}>
-                    <Text style={[s.batterName, !b.out && s.batterNameActive]}>{b.name}</Text>
-                    {b.name === fieldingTeam.captain && <Text style={s.capBadge}>©</Text>}
-                    {b.out ? <Text style={s.outLabel}>out</Text> : <Text style={s.notOutLabel}>not out</Text>}
-                  </View>
-                  <Text style={s.colStat}>{b.runs}</Text>
-                  <Text style={s.colStat}>{b.balls}</Text>
-                  <Text style={s.colStat}>{b.fours}</Text>
-                  <Text style={s.colStat}>{b.sixes}</Text>
-                  <Text style={s.colStat}>{b.balls > 0 ? ((b.runs / b.balls) * 100).toFixed(0) : '-'}</Text>
-                </View>
-              ))}
-              <View style={s.totalRow}>
-                <Text style={s.totalLabel}>Total</Text>
-                <Text style={s.totalVal}>{innings2.runs}/{innings2.wickets} ({innings2.overs}.{innings2.balls} ov)</Text>
-              </View>
-            </View>
-            <View style={s.card}>
-              <Text style={s.cardTitle}>🎳 {battingTeam.name} Bowling (2nd Innings)</Text>
-              <View style={s.tableHeader}>
-                <Text style={s.colBatter}>Bowler</Text>
-                <Text style={s.colStat}>O</Text><Text style={s.colStat}>R</Text>
-                <Text style={s.colStat}>W</Text><Text style={s.colStat}>Eco</Text>
-              </View>
-              {innings2.bowlers.map((b: any, i: number) => (
-                <View key={i} style={s.tableRow}>
-                  <View style={s.colBatterWrap}>
-                    <Text style={s.batterName}>{b.name}</Text>
-                    {b.name === battingTeam.captain && <Text style={s.capBadge}>©</Text>}
-                  </View>
-                  <Text style={s.colStat}>{b.overs}.{b.balls}</Text>
-                  <Text style={s.colStat}>{b.runs}</Text>
-                  <Text style={[s.colStat, b.wickets > 0 && s.wicketStat]}>{b.wickets}</Text>
-                  <Text style={s.colStat}>
-                    {(b.overs * 6 + b.balls) > 0 ? (b.runs / ((b.overs * 6 + b.balls) / 6)).toFixed(1) : '-'}
-                  </Text>
-                </View>
-              ))}
-            </View>
-          </>
+        {!liveView && !isFirstInnings && isLoserPays && (
+          <LoserSettlement resultText={resultText} battingTeam={battingTeam} fieldingTeam={fieldingTeam} bet={bet} />
         )}
+
+        {/* Innings tabs */}
+        <View style={s.tabs}>
+          {teamRows.map(({ team, inn, n }) => (
+            <TouchableOpacity
+              key={n}
+              style={[s.tab, tab === n && s.tabOn]}
+              disabled={!inn}
+              onPress={() => setTab(n)}>
+              <Text style={[s.tabTeam, tab === n && s.tabTeamOn, !inn && s.tabOff]}>{abbr(team.name)}</Text>
+              <Text style={[s.tabScore, tab === n && s.tabScoreOn, !inn && s.tabOff]}>
+                {inn ? `${inn.runs}/${inn.wickets} (${inn.overs}.${inn.balls})` : 'Yet to bat'}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+
+        <View style={s.viewRow}>
+          <Text style={s.inningsTitle}>
+            {tab === 1 ? battingTeam.name : fieldingTeam.name} · {tab === 1 ? '1st' : '2nd'} Innings
+          </Text>
+          <View style={s.viewToggle}>
+            {(['card', 'log'] as const).map(v => (
+              <TouchableOpacity key={v} style={[s.viewBtn, view === v && s.viewBtnOn]} onPress={() => setView(v)}>
+                <Text style={[s.viewBtnText, view === v && s.viewBtnTextOn]}>{v === 'card' ? 'Scorecard' : 'Commentary'}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        </View>
+        {view === 'log' ? (
+          <View style={s.logCard}>
+            <CommentaryList log={(tab === 1 ? innings1 : innings2)?.ballLog ?? []} />
+          </View>
+        ) : tab === 1 ? (
+          <InningsScorecard
+            inn={innings1}
+            team={battingTeam}
+            bowlingTeam={fieldingTeam}
+            inProgress={!!liveView && !innings2}
+          />
+        ) : innings2 ? (
+          <InningsScorecard
+            inn={innings2}
+            team={fieldingTeam}
+            bowlingTeam={battingTeam}
+            inProgress={!!liveView}
+          />
+        ) : null}
 
         {isFirstInnings && !liveView && (
           <TouchableOpacity
@@ -365,7 +415,7 @@ export default function ScorecardScreen({ navigation, route }: any) {
                 target: innings1.runs + 1, innings1,
                 originalBattingTeam: battingTeam,
                 originalFieldingTeam: fieldingTeam, bet,
-                tossWinner, tossChoice,
+                tossWinner, tossChoice, matchId, matchKey,
               };
               saveInProgressMatch({ ...secondInningsParams, isSecondInnings: true, savedState: null, live }).catch(() => {});
               navigation.navigate('Scoring', { ...secondInningsParams, live });
@@ -390,21 +440,82 @@ const s = StyleSheet.create({
   container: { flex: 1, backgroundColor: C.bg },
   header: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    paddingHorizontal: 16, paddingTop: 52, paddingBottom: 12,
+    paddingHorizontal: 12, paddingTop: 44, paddingBottom: 10,
     backgroundColor: C.white, borderBottomWidth: 1, borderBottomColor: C.cardBorder,
   },
-  back: { color: C.primary, fontSize: 15, fontWeight: '600', width: 80 },
-  headerTitle: { color: C.text, fontSize: 17, fontWeight: '700' },
-  scroll: { padding: 16, paddingBottom: 40 },
-  summaryCard: { backgroundColor: C.primary, borderRadius: 20, padding: 20, marginBottom: 16, alignItems: 'center' },
-  matchTitle: { color: C.white, fontSize: 16, fontWeight: '800', marginBottom: 2 },
-  matchSub: { color: '#ffffff80', fontSize: 12, marginBottom: 16, textAlign: 'center' },
-  scoreBox: { alignItems: 'center', marginBottom: 4 },
-  bigScore: { color: C.white, fontSize: 52, fontWeight: '900', lineHeight: 56 },
-  bigOvers: { color: '#ffffff80', fontSize: 14, marginBottom: 8 },
-  score2nd: { color: '#ffffffcc', fontSize: 14, fontWeight: '700', marginBottom: 10 },
-  resultBox: { backgroundColor: '#ffffff20', borderRadius: 10, paddingHorizontal: 16, paddingVertical: 6 },
-  resultText: { color: C.white, fontSize: 13, fontWeight: '700' },
+  backBtn: { width: 40, height: 36, justifyContent: 'center' },
+  back: { color: C.text, fontSize: 22, fontWeight: '600' },
+  headerMid: { flex: 1, alignItems: 'center' },
+  headerTitle: { color: C.text, fontSize: 15, fontWeight: '800' },
+  headerSub: { color: C.textMuted, fontSize: 11, fontWeight: '600', marginTop: 1 },
+  scroll: { padding: 12, paddingBottom: 40 },
+  videoBtn: {
+    flexDirection: 'row', alignItems: 'center', gap: 12, backgroundColor: '#0B1730',
+    borderRadius: 16, padding: 14, marginBottom: 12,
+  },
+  videoBtnIcon: { color: C.white, fontSize: 16, width: 38, height: 38, borderRadius: 19, backgroundColor: '#EF233C', textAlign: 'center', lineHeight: 38, overflow: 'hidden' },
+  videoBtnTitle: { color: C.white, fontSize: 15, fontWeight: '900' },
+  videoBtnSub: { color: '#94A3B8', fontSize: 12, marginTop: 2 },
+  videoBtnArrow: { color: '#FACC15', fontSize: 26, fontWeight: '700' },
+
+  // Summary banner
+  summary: { backgroundColor: '#0B1730', borderRadius: 18, padding: 16, marginBottom: 12 },
+  summaryTop: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 },
+  summaryMeta: { flex: 1, color: '#94A3B8', fontSize: 10, fontWeight: '800', letterSpacing: 0.8, marginRight: 8 },
+  statusPill: { flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: '#16A34A', borderRadius: 10, paddingHorizontal: 8, paddingVertical: 3 },
+  statusPillLive: { backgroundColor: C.primary },
+  statusPillBreak: { backgroundColor: '#D97706' },
+  liveDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: C.white },
+  statusPillText: { color: C.white, fontSize: 9, fontWeight: '900', letterSpacing: 0.8 },
+  teamRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 6 },
+  badge: { width: 34, height: 34, borderRadius: 17, backgroundColor: C.primary, justifyContent: 'center', alignItems: 'center', marginRight: 10 },
+  badge2: { backgroundColor: C.accent },
+  badgeText: { color: C.white, fontSize: 10, fontWeight: '900' },
+  teamName: { flex: 1, color: C.white, fontSize: 14, fontWeight: '800' },
+  teamScore: { color: C.white, fontSize: 20, fontWeight: '900' },
+  teamOvers: { color: '#94A3B8', fontSize: 12, fontWeight: '600' },
+  yetToBat: { color: '#64748B', fontSize: 12, fontWeight: '700' },
+  dim: { color: '#94A3B8' },
+  statusLine: { marginTop: 10, fontSize: 13, fontWeight: '800' },
+  statusWin: { color: '#4ADE80' },
+  statusLive: { color: '#FACC15' },
+  statusBreak: { color: '#FBBF24' },
+  toss: { marginTop: 6, color: '#94A3B8', fontSize: 11, fontWeight: '600' },
+
+  // Loser to pay
+  expenseCard: { backgroundColor: C.white, borderRadius: 16, padding: 14, marginBottom: 12, borderWidth: 1, borderColor: C.orange + '40' },
+  expenseHead: { flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
+  expenseIcon: { fontSize: 26, marginRight: 10 },
+  expenseTitle: { fontSize: 15, fontWeight: '900', color: C.text },
+  expenseSub: { fontSize: 11, color: C.textMuted },
+  expenseTotal: { fontSize: 22, fontWeight: '900', color: C.orange },
+  expenseRow: { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 6, borderTopWidth: 1, borderTopColor: C.divider },
+  expenseItem: { fontSize: 13, color: C.textSub, fontWeight: '600' },
+  expenseAmt: { fontSize: 13, color: C.text, fontWeight: '800' },
+  expenseNote: { fontSize: 12, color: C.textSub, marginTop: 8, lineHeight: 18 },
+  expenseVerdict: { marginTop: 10, backgroundColor: C.orangeLight, borderRadius: 10, padding: 10 },
+  expenseVerdictTie: { backgroundColor: C.accentLight },
+  expenseVerdictText: { fontSize: 13, fontWeight: '900', color: '#9A3412' },
+  expenseVerdictTextTie: { color: C.accent },
+
+  // Innings tabs
+  tabs: { flexDirection: 'row', backgroundColor: C.white, borderRadius: 14, borderWidth: 1, borderColor: C.cardBorder, marginBottom: 12, overflow: 'hidden' },
+  tab: { flex: 1, paddingVertical: 10, alignItems: 'center', borderBottomWidth: 3, borderBottomColor: 'transparent' },
+  tabOn: { borderBottomColor: C.primary, backgroundColor: '#FFF7F7' },
+  tabTeam: { fontSize: 12, fontWeight: '900', color: C.textSub, letterSpacing: 0.5 },
+  tabTeamOn: { color: C.primary },
+  tabScore: { fontSize: 11, fontWeight: '700', color: C.textMuted, marginTop: 2 },
+  tabScoreOn: { color: C.text },
+  tabOff: { color: '#CBD5E1' },
+  viewRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 },
+  viewToggle: { flexDirection: 'row', backgroundColor: '#E2E8F0', borderRadius: 10, padding: 3 },
+  viewBtn: { paddingHorizontal: 10, paddingVertical: 5, borderRadius: 8 },
+  viewBtnOn: { backgroundColor: C.white },
+  viewBtnText: { fontSize: 11, fontWeight: '700', color: C.textSub },
+  viewBtnTextOn: { color: C.text, fontWeight: '900' },
+  logCard: { backgroundColor: C.white, borderRadius: 14, paddingHorizontal: 12, marginBottom: 12, borderWidth: 1, borderColor: C.cardBorder },
+  inningsTitle: { flex: 1, fontSize: 12, fontWeight: '900', color: C.textSub, letterSpacing: 0.5, marginLeft: 2 },
+
   betCard: {
     backgroundColor: C.white, borderRadius: 20, padding: 16, marginBottom: 12,
     borderWidth: 2, borderColor: C.orange + '30',
@@ -466,27 +577,6 @@ const s = StyleSheet.create({
     padding: 12, alignItems: 'center', borderWidth: 1, borderColor: C.green + '40',
   },
   allConfirmedText: { color: C.green, fontWeight: '800', fontSize: 13 },
-  card: {
-    backgroundColor: C.white, borderRadius: 16, padding: 14, marginBottom: 12,
-    borderWidth: 1, borderColor: C.cardBorder,
-    shadowColor: C.shadow, shadowOffset: { width: 0, height: 2 }, shadowOpacity: 1, shadowRadius: 6, elevation: 2,
-  },
-  cardTitle: { fontSize: 14, fontWeight: '800', color: C.text, marginBottom: 12 },
-  tableHeader: { flexDirection: 'row', paddingBottom: 8, borderBottomWidth: 1, borderBottomColor: C.divider },
-  tableRow: { flexDirection: 'row', paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: C.divider },
-  tableRowOut: { opacity: 0.6 },
-  colBatter: { flex: 1, fontSize: 11, fontWeight: '700', color: C.textMuted },
-  colBatterWrap: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 4, flexWrap: 'wrap' },
-  colStat: { width: 38, textAlign: 'center', fontSize: 13, color: C.text, fontWeight: '600' },
-  batterName: { fontSize: 14, color: C.textSub, fontWeight: '500' },
-  batterNameActive: { color: C.text, fontWeight: '700' },
-  capBadge: { fontSize: 11, color: C.orange, fontWeight: '700' },
-  outLabel: { fontSize: 10, color: C.primary, fontWeight: '600', backgroundColor: C.primaryLight, paddingHorizontal: 5, paddingVertical: 1, borderRadius: 4 },
-  notOutLabel: { fontSize: 10, color: C.green, fontWeight: '600', backgroundColor: C.greenLight, paddingHorizontal: 5, paddingVertical: 1, borderRadius: 4 },
-  wicketStat: { color: C.primary, fontWeight: '800' },
-  totalRow: { flexDirection: 'row', justifyContent: 'space-between', paddingTop: 10 },
-  totalLabel: { fontSize: 14, fontWeight: '800', color: C.text },
-  totalVal: { fontSize: 14, fontWeight: '800', color: C.primary },
   start2ndBtn: {
     backgroundColor: C.green, borderRadius: 14, paddingVertical: 16,
     alignItems: 'center', marginBottom: 12,
