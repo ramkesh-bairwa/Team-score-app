@@ -4,6 +4,7 @@ import {
 } from 'react-native';
 import { getOverlaySummary, getOverlayLink, getCameraLinks, isLocalAddress, leaveSession, LiveSession } from '../services/live';
 import { popup } from '../components/Popup';
+import ReplayControls from '../components/ReplayControls';
 import { C } from '../theme/colors';
 
 const PRISM_ANDROID = 'com.prism.live';
@@ -202,6 +203,9 @@ export default function LiveStreamScreen({ navigation, route }: any) {
             </Animated.View>
           )}
         </View>
+
+        {/* Replays on the camera stream, right under the live score */}
+        {status !== 'ended' && <ReplayControls session={session} />}
 
         {/* Built-in camera stream */}
         <View style={s.card}>

@@ -66,6 +66,10 @@ export const leaveSession = async (code: string, token: string) =>
 export const getCameraLinks = async (s: LiveSession): Promise<{ roomId: string; studioUrl: string; watchUrl: string }> =>
   call('POST', `/${s.code}/camera`, { token: s.token });
 
+// Puts a replay of the last `seconds` on air on the match's camera device (or stops one)
+export const sendReplay = async (s: LiveSession, action: 'start' | 'stop', seconds = 30, rate = 1) =>
+  call('POST', `/${s.code}/replay`, { token: s.token, action, seconds, rate });
+
 // Public live-score summary (same feed as the YouTube overlay)
 export const getOverlaySummary = async (code: string) => call('GET', `/${code}/overlay`);
 

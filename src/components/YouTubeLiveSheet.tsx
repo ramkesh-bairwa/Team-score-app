@@ -3,6 +3,7 @@ import { View, Text, StyleSheet, Modal, TouchableOpacity, ScrollView, Share, Lin
 import { LiveSession, LivePayload, getCameraLinks, getOverlayLink, isLocalAddress } from '../services/live';
 import ServerSettings from './ServerSettings';
 import QRCode from './QRCode';
+import ReplayControls from './ReplayControls';
 import { popup } from './Popup';
 import { C } from '../theme/colors';
 
@@ -122,6 +123,8 @@ export default function YouTubeLiveSheet({ visible, session, getPayload, onClose
                 </>
               )}
             </View>
+
+            <ReplayControls session={session} dark={false} />
 
             {/* Two-device setup: this phone scores, a second phone films and streams */}
             <View style={s.phoneBox}>
